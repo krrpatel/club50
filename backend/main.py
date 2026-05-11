@@ -170,12 +170,10 @@ class LoginRequest(BaseModel):
 
 
 class ProfileUpdateRequest(BaseModel):
-    """Profile update request"""
+    """Profile update request - semester cannot be changed"""
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     email: Optional[str] = None
-    current_semester: int = Field(..., ge=1, le=8)
-    academic_year: str = Field(..., min_length=5)
 
 
 class ProblemGenerationRequest(BaseModel):
@@ -185,6 +183,26 @@ class ProblemGenerationRequest(BaseModel):
     transcript: str = Field(..., min_length=1)
     difficulty: str = Field(default="Medium", pattern="^(Easy|Medium|Hard)$")
     previously_generated: str = Field(default="")
+
+class WeekListItem(BaseModel):
+    """Lightweight week info for list endpoint"""
+    id: str
+    title: str
+
+class WeekRequestFull(BaseModel):
+    """Comprehensive week creation/update request with all details"""
+    title: str
+    description: str
+    subject: Optional[str] = ""
+    topic: Optional[str] = ""
+    semester: Optional[int] = None
+    academic_years: Optional[List[str]] = []
+    video_url: Optional[str] = ""
+    video_description: Optional[str] = ""
+    display_order: Optional[int] = 0
+    problem_ids: List[str]
+    resource_files: Optional[List[Dict[str, Any]]] = []
+    generated_problems: Optional[List[Dict[str, Any]]] = []
 
 class WeekRequest(BaseModel):
     title: str
@@ -485,6 +503,14 @@ def _format_week(row: Dict[str, Any], include_signed_urls: bool = False) -> Dict
         "generated_problems": row.get("generated_problems") or [],
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
+    }
+
+
+def _format_week_list(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Format week for list endpoint - return only id and title for performance"""
+    return {
+        "id": row.get("id"),
+        "title": row.get("title"),
     }
 
 
@@ -1189,29 +1215,36 @@ async def auth_me(current: Dict[str, Any] = Depends(get_current_user)):
 
 @app.put("/api/v1/auth/profile")
 async def update_profile(req: ProfileUpdateRequest, current: Dict[str, Any] = Depends(get_current_user)):
+    """Update user profile - semester cannot be changed after initial setup"""
     profile = current["profile"]
+    
+    # Validate that first_name and last_name cannot be changed if they match enrollment record
+    enrollment_full_name = profile.get("student_full_name", "")
+    current_first = profile.get("first_name", "")
+    current_last = profile.get("last_name", "")
+    
+    # If name comes from enrollment, prevent changes
+    if enrollment_full_name:
+        if req.first_name is not None and req.first_name != current_first:
+            raise HTTPException(400, "First name cannot be changed - it comes from enrollment record")
+        if req.last_name is not None and req.last_name != current_last:
+            raise HTTPException(400, "Last name cannot be changed - it comes from enrollment record")
+    
     updated = _upsert_profile({
         **profile,
         "first_name": req.first_name if req.first_name is not None else profile.get("first_name"),
         "last_name": req.last_name if req.last_name is not None else profile.get("last_name"),
         "email": req.email if req.email is not None else profile.get("email"),
-        "current_semester": req.current_semester,
-        "academic_year": req.academic_year,
         "profile_completed": True,
     })
     return {"user": _profile_payload_from_record(updated), "progress": _progress_for_profile(updated)}
 
 
 @app.get("/api/v1/weeks")
-async def list_weeks(authorization: Optional[str] = Header(None)):
-    profile = None
-    if authorization and authorization.lower().startswith("bearer "):
-        try:
-            token = authorization.split(" ", 1)[1].strip()
-            auth_user = _supabase_request("GET", "/auth/v1/user", bearer=token, expected=(200,))
-            profile = _fetch_profile_by_user_id(auth_user["id"])
-        except HTTPException:
-            profile = None
+async def list_weeks(current: Dict[str, Any] = Depends(get_current_user)):
+    """Get all available weeks for the user's semester - requires authentication
+    Returns only id and title for performance"""
+    profile = current["profile"]
     rows = _supabase_request(
         "GET",
         "/rest/v1/weeks",
@@ -1222,8 +1255,13 @@ async def list_weeks(authorization: Optional[str] = Header(None)):
         }
     )
 
-    visible_rows = [row for row in rows if profile and profile.get("role") == "admin" or _week_visible_to_profile(row, profile)]
-    return [_format_week(row) for row in visible_rows]
+    # Admin sees all weeks, regular users see only their semester's weeks
+    if profile.get("role") == "admin":
+        visible_rows = rows
+    else:
+        visible_rows = [row for row in rows if _week_visible_to_profile(row, profile)]
+    
+    return [_format_week_list(row) for row in visible_rows]
 
 
 @app.get("/api/v1/weeks/{week_id}")
@@ -1257,7 +1295,8 @@ async def get_week(week_id: str, current: Dict[str, Any] = Depends(get_current_u
 
 
 @app.post("/api/v1/admin/weeks")
-async def create_week(req: WeekRequest, admin: Dict[str, Any] = Depends(require_admin)):
+async def create_week(req: WeekRequestFull, admin: Dict[str, Any] = Depends(require_admin)):
+    """Create a new week with all details including semester and academic years"""
     payload = req.model_dump()
     payload["problem_ids"] = _validate_problem_ids(payload["problem_ids"])
     rows = _supabase_request(
@@ -1272,7 +1311,8 @@ async def create_week(req: WeekRequest, admin: Dict[str, Any] = Depends(require_
 
 
 @app.put("/api/v1/admin/weeks/{week_id}")
-async def update_week(week_id: str, req: WeekRequest, admin: Dict[str, Any] = Depends(require_admin)):
+async def update_week(week_id: str, req: WeekRequestFull, admin: Dict[str, Any] = Depends(require_admin)):
+    """Update an existing week with all details"""
     payload = req.model_dump()
     payload["problem_ids"] = _validate_problem_ids(payload["problem_ids"])
     rows = _supabase_request(
