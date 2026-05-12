@@ -115,6 +115,7 @@ class Check50Result(BaseModel):
 # In-memory store (replace with proper DB in production)
 SUBMISSIONS: Dict[str, Dict] = {}
 LEADERBOARD: Dict[str, Dict] = {}   # keyed by username
+WRAPPER_PLAN_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # ---------------------------------------------------------------------------
 # Schemas
@@ -962,21 +963,256 @@ if __name__ == "__main__":
         return "", str(e)
 
 
-def _run_java(code: str, test_input: str, problem_id: str = "") -> tuple[str, Optional[str]]:
-    """Compile and execute Java code, return (stdout, stderr)."""
-    try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir = Path(tmpdir)
-            javac_bin = _resolve_java_binary("javac")
-            java_bin = _resolve_java_binary("java")
-            
-            # Wrap user code if it's just a method
-            if "public static void main" not in code:
-                # Determine which method to wrap
-                if problem_id == "prob1" or "twoSum" in code or "two_sum" in code:
-                    wrapped = f"""{code}
+def _fallback_wrapper_plan(language: str, code: str) -> Optional[Dict[str, Any]]:
+    normalized = language.strip().lower()
+    if normalized == "c":
+        match = re.search(r"([A-Za-z_][\w\s\*]*?)\s+([A-Za-z_]\w*)\s*\(([^)]*)\)", code)
+        if not match:
+            return None
+        return_type = " ".join(match.group(1).split())
+        function_name = match.group(2)
+        raw_params = [part.strip() for part in match.group(3).split(",") if part.strip() and part.strip() != "void"]
+        params: List[Dict[str, Any]] = []
+        last_array_name = ""
+        for raw_param in raw_params:
+            normalized_param = " ".join(raw_param.split())
+            pieces = normalized_param.replace("*", " * ").split()
+            param_name = pieces[-1].replace("*", "")
+            if "char" in normalized_param and "*" in normalized_param:
+                params.append({"name": param_name, "kind": "string"})
+                last_array_name = ""
+            elif "int" in normalized_param and "*" in normalized_param:
+                params.append({"name": param_name, "kind": "int_array"})
+                last_array_name = param_name
+            elif "int" in normalized_param and last_array_name and param_name.lower().endswith("size"):
+                params.append({"name": param_name, "kind": "derived_array_length", "source": last_array_name})
+            elif "int" in normalized_param:
+                params.append({"name": param_name, "kind": "int"})
+                last_array_name = ""
+            else:
+                params.append({"name": param_name, "kind": "string"})
+                last_array_name = ""
+        return {
+            "target_name": function_name,
+            "target_container": "free_function",
+            "is_static": True,
+            "return_kind": "int" if "int" in return_type else "string",
+            "params": params,
+        }
 
-public class Solution {{
+    if normalized == "java":
+        class_match = re.search(r"\bclass\s+([A-Za-z_]\w*)\b", code)
+        class_name = class_match.group(1) if class_match else "Solution"
+        method_match = None
+        for candidate in re.finditer(
+            r"(public|private|protected)?\s*(static\s+)?([A-Za-z_][\w<>\[\]]*)\s+([A-Za-z_]\w*)\s*\(([^)]*)\)",
+            code,
+        ):
+            method_name = candidate.group(4)
+            if method_name != class_name:
+                method_match = candidate
+                break
+        if not method_match:
+            return None
+        return_type = method_match.group(3)
+        is_static = bool(method_match.group(2))
+        raw_params = [part.strip() for part in method_match.group(5).split(",") if part.strip()]
+        params = []
+        last_array_name = ""
+        for raw_param in raw_params:
+            normalized_param = " ".join(raw_param.split())
+            pieces = normalized_param.split()
+            param_name = pieces[-1]
+            param_type = " ".join(pieces[:-1])
+            if "String" in param_type:
+                params.append({"name": param_name, "kind": "string"})
+                last_array_name = ""
+            elif "int[]" in param_type:
+                params.append({"name": param_name, "kind": "int_array"})
+                last_array_name = param_name
+            elif "int" in param_type and last_array_name and param_name.lower().endswith("size"):
+                params.append({"name": param_name, "kind": "derived_array_length", "source": last_array_name})
+            elif "int" in param_type:
+                params.append({"name": param_name, "kind": "int"})
+                last_array_name = ""
+            else:
+                params.append({"name": param_name, "kind": "string"})
+                last_array_name = ""
+        return {
+            "target_name": method_match.group(4),
+            "target_container": class_name,
+            "is_static": is_static,
+            "return_kind": "int" if return_type in ("int", "Integer") else "string",
+            "params": params,
+        }
+    return None
+
+
+def _infer_wrapper_plan(language: str, code: str, test_input: str) -> Optional[Dict[str, Any]]:
+    cache_key = hashlib.sha256(f"{language}\n{code}".encode("utf-8", errors="ignore")).hexdigest()
+    if cache_key in WRAPPER_PLAN_CACHE:
+        return WRAPPER_PLAN_CACHE[cache_key]
+
+    fallback = _fallback_wrapper_plan(language, code)
+    if not _ai_enabled():
+        if fallback:
+            WRAPPER_PLAN_CACHE[cache_key] = fallback
+        return fallback
+
+    try:
+        payload = _call_ai_json(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Infer how to wrap a submitted competitive-programming solution method for local execution. "
+                        "Return only JSON with keys: target_name, target_container, is_static, return_kind, params. "
+                        "Supported param kinds are: int_array, int, string, derived_array_length. "
+                        "Use derived_array_length only for a size parameter tied to an int_array parameter. "
+                        "Supported return kinds are: int, string, bool. "
+                        "Do not include explanations."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "language": language,
+                            "code": code,
+                            "sample_raw_input": test_input,
+                            "fallback_guess": fallback,
+                        },
+                        ensure_ascii=True,
+                    ),
+                },
+            ]
+        )
+        if isinstance(payload, dict) and payload.get("target_name") and isinstance(payload.get("params"), list):
+            WRAPPER_PLAN_CACHE[cache_key] = payload
+            return payload
+    except Exception as exc:
+        logger.warning(f"Wrapper inference failed: {exc}")
+
+    if fallback:
+        WRAPPER_PLAN_CACHE[cache_key] = fallback
+    return fallback
+
+
+def _java_wrapper_from_plan(plan: Dict[str, Any], runner_class: str = "Runner") -> str:
+    params = plan.get("params") or []
+    setup_lines = [
+        "String raw = new String(System.in.readAllBytes()).trim();",
+        'String normalized = raw.replace("[", " ").replace("]", " ").trim();',
+        'String[] commaTokens = normalized.isEmpty() ? new String[0] : normalized.split("\\\\s*,\\\\s*");',
+        'String[] lineTokens = raw.split("\\\\R");',
+    ]
+    call_args: List[str] = []
+    array_name = ""
+    int_index = 0
+    for param in params:
+        kind = param.get("kind")
+        name = param.get("name") or f"arg{len(call_args)}"
+        if kind == "int_array":
+            array_name = name
+            setup_lines.extend(
+                [
+                    f"int[] {name} = new int[commaTokens.length];",
+                    f"for (int i = 0; i < commaTokens.length; i++) {{ {name}[i] = Integer.parseInt(commaTokens[i].trim()); }}",
+                ]
+            )
+            call_args.append(name)
+        elif kind == "derived_array_length":
+            source = param.get("source") or array_name
+            setup_lines.append(f"int {name} = {source}.length;")
+            call_args.append(name)
+        elif kind == "int":
+            source_index = int_index
+            setup_lines.append(
+                f'int {name} = Integer.parseInt((lineTokens.length > {source_index} ? lineTokens[{source_index}] : normalized).replace("[", "").replace("]", "").trim().split(",")[0].trim());'
+            )
+            call_args.append(name)
+            int_index += 1
+        else:
+            setup_lines.append(f"String {name} = raw;")
+            call_args.append(name)
+
+    target_container = plan.get("target_container") or "Solution"
+    target_name = plan.get("target_name") or "solve"
+    if plan.get("is_static"):
+        invocation = f"{target_container}.{target_name}({', '.join(call_args)})"
+    else:
+        invocation = f"new {target_container}().{target_name}({', '.join(call_args)})"
+
+    return_kind = (plan.get("return_kind") or "int").lower()
+    if return_kind == "bool":
+        result_lines = [f"boolean result = {invocation};", 'System.out.println(result ? "true" : "false");']
+    elif return_kind == "string":
+        result_lines = [f"String result = {invocation};", "System.out.println(result);"]
+    else:
+        result_lines = [f"int result = {invocation};", "System.out.println(result);"]
+
+    return (
+        f"class {runner_class} {{\n"
+        "    public static void main(String[] args) throws Exception {\n"
+        + "\n".join(f"        {line}" for line in setup_lines + result_lines)
+        + "\n    }\n}\n"
+    )
+
+
+def _c_wrapper_from_plan(plan: Dict[str, Any]) -> str:
+    params = plan.get("params") or []
+    setup_lines = [
+        "char buffer[65536];",
+        "if (!fgets(buffer, sizeof(buffer), stdin)) { return 0; }",
+        'const char *delims = "[], \\n\\r\\t";',
+    ]
+    call_args: List[str] = []
+    array_name = ""
+    for param in params:
+        kind = param.get("kind")
+        name = param.get("name") or f"arg{len(call_args)}"
+        if kind == "int_array":
+            array_name = name
+            setup_lines.extend(
+                [
+                    f"int {name}[8192];",
+                    f"int {name}_count = 0;",
+                    "char *token = strtok(buffer, delims);",
+                    f"while (token != NULL && {name}_count < 8192) {{",
+                    f"    {name}[{name}_count++] = atoi(token);",
+                    "    token = strtok(NULL, delims);",
+                    "}",
+                ]
+            )
+            call_args.append(name)
+        elif kind == "derived_array_length":
+            source = param.get("source") or array_name
+            setup_lines.append(f"int {name} = {source}_count;")
+            call_args.append(name)
+        elif kind == "int":
+            setup_lines.append(f"int {name} = atoi(buffer);")
+            call_args.append(name)
+        else:
+            setup_lines.append(f"char *{name} = buffer;")
+            call_args.append(name)
+
+    target_name = plan.get("target_name") or "solve"
+    return_kind = (plan.get("return_kind") or "int").lower()
+    if return_kind == "string":
+        result_lines = [f'char *result = {target_name}({", ".join(call_args)});', 'printf("%s\\n", result);']
+    else:
+        result_lines = [f'int result = {target_name}({", ".join(call_args)});', 'printf("%d\\n", result);']
+
+    return (
+        "\n#include <string.h>\n\nint main(void) {\n"
+        + "\n".join(f"    {line}" for line in setup_lines + result_lines)
+        + "\n    return 0;\n}\n"
+    )
+
+
+def _java_main_wrapper(problem_id: str, code: str, runner_class: str = "Solution") -> str:
+    if problem_id == "prob1" or "twoSum" in code or "two_sum" in code:
+        return f"""public class {runner_class} {{
     public static void main(String[] args) {{
         java.util.Scanner sc = new java.util.Scanner(System.in);
         int n = sc.nextInt();
@@ -991,10 +1227,8 @@ public class Solution {{
     }}
 }}
 """
-                elif problem_id == "prob2" or "fibonacci" in code.lower() or "fib" in code.lower():
-                    wrapped = f"""{code}
-
-public class Solution {{
+    if problem_id == "prob2" or "fibonacci" in code.lower() or "fib" in code.lower():
+        return f"""public class {runner_class} {{
     public static void main(String[] args) {{
         java.util.Scanner sc = new java.util.Scanner(System.in);
         int n = sc.nextInt();
@@ -1004,10 +1238,7 @@ public class Solution {{
     }}
 }}
 """
-                else:
-                    wrapped = f"""{code}
-
-public class Solution {{
+    return f"""public class {runner_class} {{
     public static void main(String[] args) {{
         java.util.Scanner sc = new java.util.Scanner(System.in);
         String line = sc.nextLine();
@@ -1017,11 +1248,87 @@ public class Solution {{
     }}
 }}
 """
+
+
+def _java_runner_wrapper(problem_id: str, code: str, runner_class: str = "Runner") -> str:
+    if problem_id == "prob1" or "twoSum" in code or "two_sum" in code:
+        return f"""class {runner_class} {{
+    public static void main(String[] args) {{
+        java.util.Scanner sc = new java.util.Scanner(System.in);
+        int n = sc.nextInt();
+        int[] nums = new int[n];
+        for (int i = 0; i < n; i++) {{
+            nums[i] = sc.nextInt();
+        }}
+        int target = sc.nextInt();
+        int[] ans = new Solution().twoSum(nums, target);
+        System.out.println(ans[0] + " " + ans[1]);
+        sc.close();
+    }}
+}}
+"""
+    if problem_id == "prob2" or "fibonacci" in code.lower() or "fib" in code.lower():
+        return f"""class {runner_class} {{
+    public static void main(String[] args) {{
+        java.util.Scanner sc = new java.util.Scanner(System.in);
+        int n = sc.nextInt();
+        long result = new Solution().fibonacci(n);
+        System.out.println(result);
+        sc.close();
+    }}
+}}
+"""
+    return f"""class {runner_class} {{
+    public static void main(String[] args) {{
+        java.util.Scanner sc = new java.util.Scanner(System.in);
+        String line = sc.nextLine();
+        boolean result = new Solution().isPalindrome(line);
+        System.out.println(result ? "YES" : "NO");
+        sc.close();
+    }}
+}}
+"""
+
+
+def _run_java(code: str, test_input: str, problem_id: str = "") -> tuple[str, Optional[str]]:
+    """Compile and execute Java code, return (stdout, stderr)."""
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            javac_bin = _resolve_java_binary("javac")
+            java_bin = _resolve_java_binary("java")
+            entry_class = "Solution"
+             
+            # Wrap user code if it's just a method
+            if "public static void main" not in code:
+                wrapper_plan = _infer_wrapper_plan("java", code, test_input)
+                if wrapper_plan and re.search(r"\bclass\s+Solution\b", code):
+                    wrapped = f"""{code}
+
+{_java_wrapper_from_plan(wrapper_plan, "Runner")}
+"""
+                    entry_class = "Runner"
+                elif re.search(r"\bclass\s+Solution\b", code):
+                    wrapped = f"""{code}
+
+{_java_runner_wrapper(problem_id, code)}
+"""
+                    entry_class = "Runner"
+                elif wrapper_plan:
+                    wrapped = f"""{code}
+
+{_java_main_wrapper(problem_id, code)}
+"""
+                else:
+                    wrapped = f"""{code}
+
+{_java_main_wrapper(problem_id, code)}
+"""
                 code = wrapped
-            
+             
             # Write source
             src_file = tmpdir / "Solution.java"
-            src_file.write_text(code)
+            src_file.write_text(code, encoding="utf-8")
             
             # Compile
             compile_result = subprocess.run(
@@ -1036,7 +1343,7 @@ public class Solution {{
             
             # Run
             run_result = subprocess.run(
-                [java_bin, '-cp', str(tmpdir), 'Solution'],
+                [java_bin, '-cp', str(tmpdir), entry_class],
                 input=test_input,
                 capture_output=True,
                 text=True,
@@ -1052,6 +1359,57 @@ public class Solution {{
         return "", str(e)
 
 
+def _c_main_wrapper(problem_id: str, code: str) -> str:
+    if "findSingleNumber" in code or "singleNumber" in code:
+        return f"""{code}
+
+#include <string.h>
+
+int main(void) {{
+    char buffer[65536];
+    if (!fgets(buffer, sizeof(buffer), stdin)) {{
+        return 0;
+    }}
+
+    int nums[8192];
+    int numsSize = 0;
+    const char *delims = "[], \\n\\r\\t";
+    char *token = strtok(buffer, delims);
+    while (token != NULL && numsSize < 8192) {{
+        nums[numsSize++] = atoi(token);
+        token = strtok(NULL, delims);
+    }}
+
+    printf("%d\\n", findSingleNumber(nums, numsSize));
+    return 0;
+}}
+"""
+    if problem_id == "prob1" or "twoSum" in code or "two_sum" in code:
+        return f"""{code}
+
+int main(void) {{
+    int n;
+    scanf("%d", &n);
+    int *nums = (int *)malloc(sizeof(int) * n);
+    for (int i = 0; i < n; i++) {{
+        scanf("%d", &nums[i]);
+    }}
+    int target;
+    scanf("%d", &target);
+    int *ans = twoSum(nums, n, target);
+    printf("%d %d\\n", ans[0], ans[1]);
+    free(nums);
+    return 0;
+}}
+"""
+    return f"""{code}
+
+int main(void) {{
+    return 0;
+}}
+"""
+
+
 def _run_c(code: str, test_input: str, problem_id: str = "") -> tuple[str, Optional[str]]:
     """Compile and execute C code, return (stdout, stderr)."""
     try:
@@ -1060,6 +1418,12 @@ def _run_c(code: str, test_input: str, problem_id: str = "") -> tuple[str, Optio
             gcc_bin = _resolve_c_compiler()
             src_file = tmpdir_path / "solution.c"
             exe_file = tmpdir_path / "solution.exe"
+            if "main(" not in code:
+                wrapper_plan = _infer_wrapper_plan("c", code, test_input)
+                if wrapper_plan:
+                    code = f"{code}\n{_c_wrapper_from_plan(wrapper_plan)}"
+                else:
+                    code = _c_main_wrapper(problem_id, code)
             src_file.write_text(code, encoding="utf-8")
             compile_result = subprocess.run(
                 [gcc_bin, str(src_file), "-O2", "-std=c11", "-o", str(exe_file)],
