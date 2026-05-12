@@ -235,6 +235,7 @@ class StarterCodeRequest(BaseModel):
     input_format: str = Field(..., min_length=1)
     output_format: str = Field(..., min_length=1)
     description: Optional[str] = ""
+    function_signature: Optional[str] = ""
 
 
 class SolutionVerificationRequest(BaseModel):
@@ -611,7 +612,17 @@ def _extract_problem_templates(problem_payload: Dict[str, Any]) -> Dict[str, str
     return templates
 
 
-def _normalize_problem_payload(problem_payload: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, str]]:
+def _extract_problem_metadata(problem_payload: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = {
+        "function_signature": problem_payload.get("function_signature") or "",
+        "input_format": problem_payload.get("input_format") or "",
+        "output_format": problem_payload.get("output_format") or "",
+        "constraints": problem_payload.get("constraints") or [],
+    }
+    return metadata
+
+
+def _normalize_problem_payload(problem_payload: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, str], Dict[str, Any]]:
     payload = dict(problem_payload)
     if "statement" in payload and "description" not in payload:
         payload["description"] = payload.pop("statement")
@@ -629,13 +640,18 @@ def _normalize_problem_payload(problem_payload: Dict[str, Any]) -> tuple[Dict[st
         payload["sample_outputs"] = []
 
     templates = _extract_problem_templates(payload)
+    metadata = _extract_problem_metadata(payload)
     payload.pop("templates", None)
     payload.pop("problem_templates", None)
     payload.pop("starter_code", None)
     payload.pop("c_starter_code", None)
     payload.pop("java_starter_code", None)
     payload.pop("allowed_languages", None)
-    return payload, templates
+    payload.pop("function_signature", None)
+    payload.pop("input_format", None)
+    payload.pop("output_format", None)
+    payload.pop("constraints", None)
+    return payload, templates, metadata
 
 
 def _fetch_problem_templates(problem_id: int) -> List[Dict[str, Any]]:
@@ -650,7 +666,47 @@ def _fetch_problem_templates(problem_id: int) -> List[Dict[str, Any]]:
     )
 
 
-def _upsert_problem_templates(problem_id: int, templates: Dict[str, str]) -> List[Dict[str, Any]]:
+def _upsert_problem_metadata(problem_id: int, metadata: Dict[str, Any]) -> None:
+    if not any(
+        [
+            metadata.get("function_signature"),
+            metadata.get("input_format"),
+            metadata.get("output_format"),
+            metadata.get("constraints"),
+        ]
+    ):
+        return
+
+    _supabase_request(
+        "DELETE",
+        "/rest/v1/problem_templates",
+        service_role=True,
+        params={
+            "problem_id": f"eq.{problem_id}",
+            "language": "eq.meta",
+        },
+        headers={"Prefer": "return=minimal"},
+    )
+    _supabase_request(
+        "POST",
+        "/rest/v1/problem_templates",
+        service_role=True,
+        json_body=[
+            {
+                "problem_id": problem_id,
+                "language": "meta",
+                "starter_code": "",
+                "solution_code": json.dumps(metadata),
+            }
+        ],
+        headers={"Prefer": "return=representation"},
+    )
+
+
+def _upsert_problem_templates(problem_id: int, templates: Dict[str, str], metadata: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    if metadata is not None:
+        _upsert_problem_metadata(problem_id, metadata)
+
     normalized_templates = [
         {
             "problem_id": problem_id,
@@ -686,21 +742,35 @@ def _upsert_problem_templates(problem_id: int, templates: Dict[str, str]) -> Lis
 def _format_problem_response(problem_row: Dict[str, Any], templates: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     response = dict(problem_row, id=str(problem_row["id"]))
     template_rows = templates if templates is not None else _fetch_problem_templates(int(problem_row["id"]))
+    metadata: Dict[str, Any] = {}
+    filtered_templates: List[Dict[str, Any]] = []
+    for row in template_rows:
+        if row.get("language") == "meta":
+            try:
+                metadata = json.loads(row.get("solution_code") or "{}")
+            except json.JSONDecodeError:
+                metadata = {}
+            continue
+        filtered_templates.append(row)
     response["templates"] = [
         {
             "id": row.get("id"),
             "language": row.get("language"),
             "starter_code": row.get("starter_code") or "",
         }
-        for row in template_rows
+        for row in filtered_templates
     ]
     response["starter_code"] = {
         row.get("language"): row.get("starter_code") or ""
-        for row in template_rows
+        for row in filtered_templates
         if row.get("language") in ("c", "java")
     }
     response["sample_inputs"] = response.get("sample_inputs") or []
     response["sample_outputs"] = response.get("sample_outputs") or []
+    response["function_signature"] = metadata.get("function_signature") or response.get("function_signature") or ""
+    response["input_format"] = metadata.get("input_format") or response.get("input_format") or ""
+    response["output_format"] = metadata.get("output_format") or response.get("output_format") or ""
+    response["constraints"] = metadata.get("constraints") or response.get("constraints") or []
     return response
 
 
@@ -1042,7 +1112,7 @@ def _fallback_wrapper_plan(language: str, code: str) -> Optional[Dict[str, Any]]
             "target_name": method_match.group(4),
             "target_container": class_name,
             "is_static": is_static,
-            "return_kind": "int" if return_type in ("int", "Integer") else "string",
+            "return_kind": "int" if return_type in ("int", "Integer") else "bool" if return_type in ("boolean", "Boolean") else "string",
             "params": params,
         }
     return None
@@ -2577,14 +2647,134 @@ async def _verify_problem_solution(problem_id: str, solution: str, language: str
     return _ai_review_results(problem, language, solution, execution_results)
 
 
+def _infer_starter_signature(req: StarterCodeRequest) -> Dict[str, Any]:
+    signature_text = (req.function_signature or "").strip()
+    if signature_text:
+        parsed = None
+        if "(" in signature_text and ")" in signature_text:
+            parsed = _fallback_wrapper_plan("java", f"class Solution {{ {signature_text} {{ return 0; }} }}")
+            if not parsed:
+                parsed = _fallback_wrapper_plan("c", f"{signature_text} {{ return 0; }}")
+        if parsed:
+            return {
+                "method_name": parsed.get("target_name") or "solveProblem",
+                "return_kind": parsed.get("return_kind") or "int",
+                "params": [
+                    {
+                        "type": "int_array" if param.get("kind") == "int_array" else
+                                "string" if param.get("kind") == "string" else
+                                "int",
+                        "name": param.get("name") or f"arg{index}",
+                    }
+                    for index, param in enumerate(parsed.get("params") or [])
+                    if param.get("kind") != "derived_array_length"
+                ],
+            }
+
+    text = " ".join(
+        [
+            req.problem_name or "",
+            req.description or "",
+            req.input_format or "",
+            req.output_format or "",
+            req.function_signature or "",
+        ]
+    ).lower()
+
+    method_name = "solveProblem"
+    if "palindrome" in text:
+        method_name = "isPalindrome"
+    elif "single number" in text or "find single number" in text:
+        method_name = "findSingleNumber"
+    elif "two sum" in text:
+        method_name = "twoSum"
+    elif "fibonacci" in text:
+        method_name = "fibonacci"
+    else:
+        parts = [part for part in re.split(r"[^a-zA-Z0-9]+", req.problem_name) if part]
+        camel = "".join(part.capitalize() for part in parts) or "SolveProblem"
+        method_name = camel[0].lower() + camel[1:] if camel else "solveProblem"
+
+    return_kind = "int"
+    if any(token in text for token in ('output format: true', 'output format:\ntrue', "return true", "boolean", "returns true", "returns false")):
+        return_kind = "bool"
+    elif any(token in text for token in ("string", "palindrome")) and "true" in text and "false" in text:
+        return_kind = "bool"
+    elif "string" in (req.output_format or "").lower():
+        return_kind = "string"
+
+    params: List[Dict[str, str]] = []
+    input_text = (req.input_format or "").lower()
+    if "nums" in input_text or "array" in input_text or "[" in input_text:
+        params.append({"type": "int_array", "name": "nums"})
+    if "string" in input_text or 's =' in input_text or '"' in (req.input_format or ""):
+        params = [{"type": "string", "name": "s"}]
+    elif "target" in input_text:
+        params.append({"type": "int", "name": "target"})
+    elif not params:
+        params.append({"type": "int", "name": "n"})
+
+    return {"method_name": method_name, "return_kind": return_kind, "params": params}
+
+
+def _sanitize_generated_code(code: str, language: str, fallback: str) -> str:
+    if not isinstance(code, str):
+        return fallback
+    cleaned = code.strip().strip('"').strip()
+    if language == "java":
+        if "class Solution" not in cleaned:
+            return fallback
+        if cleaned.count("{") != cleaned.count("}"):
+            return fallback
+    if language == "c":
+        if "#include" not in cleaned:
+            return fallback
+        if cleaned.count("{") != cleaned.count("}"):
+            return fallback
+    return cleaned
+
+
 def _fallback_starter_code(req: StarterCodeRequest) -> Dict[str, str]:
-    slug_hint = re.sub(r"[^a-zA-Z0-9]+", "_", req.problem_name).strip("_").lower() or "solution"
-    method_name_parts = [part for part in re.split(r"[^a-zA-Z0-9]+", req.problem_name) if part]
-    camel_method = "".join(part.capitalize() for part in method_name_parts) or "SolveProblem"
-    java_method = camel_method[0].lower() + camel_method[1:] if camel_method else "solveProblem"
+    signature = _infer_starter_signature(req)
+    method_name = signature["method_name"]
+    c_name = method_name
+    java_method = method_name
+
+    c_return = "int"
+    java_return = "int"
+    c_default = "0"
+    java_default = "0"
+    if signature["return_kind"] == "bool":
+        c_return = "bool"
+        java_return = "boolean"
+        c_default = "false"
+        java_default = "false"
+    elif signature["return_kind"] == "string":
+        c_return = "char*"
+        java_return = "String"
+        c_default = '""'
+        java_default = '""'
+
+    c_params: List[str] = []
+    java_params: List[str] = []
+    for param in signature["params"]:
+        if param["type"] == "int_array":
+            c_params.extend([f"int* {param['name']}", f"int {param['name']}Size"])
+            java_params.append(f"int[] {param['name']}")
+        elif param["type"] == "string":
+            c_params.append(f"char* {param['name']}")
+            java_params.append(f"String {param['name']}")
+        else:
+            c_params.append(f"int {param['name']}")
+            java_params.append(f"int {param['name']}")
+
+    c_param_text = ", ".join(c_params) if c_params else "void"
+    java_param_text = ", ".join(java_params)
+
     c_code = f"""#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 
 /*
 Input format:
@@ -2594,9 +2784,9 @@ Output format:
 {req.output_format}
 */
 
-int {slug_hint}(void) {{
+{c_return} {c_name}({c_param_text}) {{
     /* TODO: implement the core logic for {req.problem_name} */
-    return 0;
+    return {c_default};
 }}
 """
     java_code = f"""import java.util.*;
@@ -2610,12 +2800,13 @@ public class Solution {{
     Output format:
     {req.output_format}
     */
-    public static int {java_method}() {{
+    public {java_return} {java_method}({java_param_text}) {{
         // TODO: implement the core logic for {req.problem_name}
-        return 0;
+        return {java_default};
     }}
 }}
 """
+    slug_hint = re.sub(r"[^a-zA-Z0-9]+", "_", req.problem_name).strip("_").lower() or "solution"
     return {"c": c_code, "java": java_code, "slug_hint": slug_hint}
 
 
@@ -2701,6 +2892,8 @@ async def generate_starter_code(req: StarterCodeRequest, admin: Dict[str, Any] =
                         "Use the problem name, input format, output format, and description to infer a clean method signature. "
                         "C code should expose a core function skeleton. Java code should expose a Solution class with a method skeleton. "
                         "Include the necessary standard imports/includes for the generated code. "
+                        "If the problem implies a known signature like palindrome/string or array-based methods, use that signature directly. "
+                        "Return compilable code only, with balanced braces and no surrounding quotes."
                         "Do not include a full solved implementation."
                     ),
                 },
@@ -2712,15 +2905,17 @@ async def generate_starter_code(req: StarterCodeRequest, admin: Dict[str, Any] =
                             "description": req.description,
                             "input_format": req.input_format,
                             "output_format": req.output_format,
+                            "function_signature": req.function_signature,
                         },
                         ensure_ascii=True,
                     ),
                 },
             ]
         )
+        fallback = _fallback_starter_code(req)
         return {
-            "c": payload.get("c") or _fallback_starter_code(req)["c"],
-            "java": payload.get("java") or _fallback_starter_code(req)["java"],
+            "c": _sanitize_generated_code(payload.get("c"), "c", fallback["c"]),
+            "java": _sanitize_generated_code(payload.get("java"), "java", fallback["java"]),
         }
     except Exception as exc:
         fallback = _fallback_starter_code(req)
@@ -2778,7 +2973,7 @@ async def get_problem(problem_id: str):
 
 @app.post("/api/v1/problems")
 async def create_problem(problem: Dict[str, Any], admin: Dict[str, Any] = Depends(require_admin)):
-    payload, templates = _normalize_problem_payload(problem)
+    payload, templates, metadata = _normalize_problem_payload(problem)
     rows = _supabase_request(
         "POST",
         "/rest/v1/problems",
@@ -2787,7 +2982,7 @@ async def create_problem(problem: Dict[str, Any], admin: Dict[str, Any] = Depend
         headers={"Prefer": "return=representation"}
     )
     created_problem = rows[0]
-    template_rows = _upsert_problem_templates(int(created_problem["id"]), templates)
+    template_rows = _upsert_problem_templates(int(created_problem["id"]), templates, metadata)
     return _format_problem_response(created_problem, template_rows)
 
 
@@ -2795,7 +2990,7 @@ async def create_problem(problem: Dict[str, Any], admin: Dict[str, Any] = Depend
 async def update_problem(problem_id: str, problem: Dict[str, Any], admin: Dict[str, Any] = Depends(require_admin)):
     existing_problem = await get_problem(problem_id)
     numeric_problem_id = int(existing_problem["id"])
-    payload, templates = _normalize_problem_payload(problem)
+    payload, templates, metadata = _normalize_problem_payload(problem)
     rows = _supabase_request(
         "PATCH",
         "/rest/v1/problems",
@@ -2807,7 +3002,7 @@ async def update_problem(problem_id: str, problem: Dict[str, Any], admin: Dict[s
     if not rows:
         raise HTTPException(404, "Problem not found")
     updated_problem = rows[0]
-    template_rows = _upsert_problem_templates(numeric_problem_id, templates)
+    template_rows = _upsert_problem_templates(numeric_problem_id, templates, metadata)
     return _format_problem_response(updated_problem, template_rows)
 
 
