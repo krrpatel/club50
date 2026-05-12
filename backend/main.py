@@ -2521,13 +2521,27 @@ def _ai_review_results(problem: Dict[str, Any], language: str, solution: str, ca
             ]
         )
         reviewed_cases = payload.get("test_cases") or case_results
+        normalized_cases = []
+        for case in reviewed_cases:
+            expected_output = case.get("expected_output", case.get("expected", ""))
+            received_output = case.get("received_output", case.get("got", case.get("output", "")))
+            normalized_cases.append(
+                {
+                    **case,
+                    "expected_output": expected_output,
+                    "received_output": received_output,
+                    "expected": expected_output,
+                    "got": received_output,
+                    "output": received_output,
+                }
+            )
         return {
             "verdict": payload.get("verdict") or summary["verdict"],
             "summary": payload.get("summary") or "",
-            "total_test_cases": len(reviewed_cases),
-            "passed_test_cases": sum(1 for case in reviewed_cases if case.get("passed")),
+            "total_test_cases": len(normalized_cases),
+            "passed_test_cases": sum(1 for case in normalized_cases if case.get("passed")),
             "language": language,
-            "test_cases": reviewed_cases,
+            "test_cases": normalized_cases,
         }
     except Exception as exc:
         logger.warning(f"AI review failed: {exc}")
@@ -2549,7 +2563,10 @@ async def _verify_problem_solution(problem_id: str, solution: str, language: str
                 "name": case["name"],
                 "input": case["input"],
                 "expected_output": case["expected_output"],
+                "expected": case["expected_output"],
                 "received_output": execution["output"],
+                "got": execution["output"],
+                "output": execution["output"],
                 "passed": (execution["output"] or "").strip() == case["expected_output"].strip() and not execution["error"],
                 "error": execution["error"],
                 "hint": None,
@@ -2567,6 +2584,7 @@ def _fallback_starter_code(req: StarterCodeRequest) -> Dict[str, str]:
     java_method = camel_method[0].lower() + camel_method[1:] if camel_method else "solveProblem"
     c_code = f"""#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /*
 Input format:
@@ -2581,7 +2599,10 @@ int {slug_hint}(void) {{
     return 0;
 }}
 """
-    java_code = f"""public class Solution {{
+    java_code = f"""import java.util.*;
+import java.io.*;
+
+public class Solution {{
     /*
     Input format:
     {req.input_format}
@@ -2679,6 +2700,7 @@ async def generate_starter_code(req: StarterCodeRequest, admin: Dict[str, Any] =
                         "Generate function or method skeleton starter code, not console-runner boilerplate. "
                         "Use the problem name, input format, output format, and description to infer a clean method signature. "
                         "C code should expose a core function skeleton. Java code should expose a Solution class with a method skeleton. "
+                        "Include the necessary standard imports/includes for the generated code. "
                         "Do not include a full solved implementation."
                     ),
                 },
