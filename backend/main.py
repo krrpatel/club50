@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable
 from enum import Enum
+from urllib.parse import urlparse
 
 import requests
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, UploadFile, File, Form, Query
@@ -184,6 +185,10 @@ class ProblemGenerationRequest(BaseModel):
     difficulty: str = Field(default="Medium", pattern="^(Easy|Medium|Hard)$")
     previously_generated: str = Field(default="")
 
+class WeekVideoInput(BaseModel):
+    url: str = Field(..., min_length=1)
+    title: Optional[str] = None
+
 class WeekListItem(BaseModel):
     """Lightweight week info for list endpoint"""
     id: str
@@ -199,6 +204,7 @@ class WeekRequestFull(BaseModel):
     academic_years: Optional[List[str]] = []
     video_url: Optional[str] = ""
     video_description: Optional[str] = ""
+    videos: Optional[List[WeekVideoInput]] = []
     display_order: Optional[int] = 0
     problem_ids: List[str]
     resource_files: Optional[List[Dict[str, Any]]] = []
@@ -220,6 +226,23 @@ class BulkSemesterUpdateRequest(BaseModel):
 class SuggestionRequest(BaseModel):
     prompt: str
     suggestion_type: str
+
+
+class StarterCodeRequest(BaseModel):
+    problem_name: str = Field(..., min_length=1)
+    input_format: str = Field(..., min_length=1)
+    output_format: str = Field(..., min_length=1)
+    description: Optional[str] = ""
+
+
+class SolutionVerificationRequest(BaseModel):
+    problem_id: str = Field(..., min_length=1)
+    solution: str = Field(..., min_length=1)
+    language: str = Field(..., min_length=1)
+
+
+class StudentApprovalRequest(BaseModel):
+    notes: Optional[str] = ""
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -408,6 +431,7 @@ def _lookup_enrollment(enrollment_number: str) -> Optional[Dict[str, Any]]:
 
 
 def _profile_payload_from_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    enrollment_metadata = record.get("enrollment_metadata") or {}
     return {
         "id": record.get("id"),
         "enrollment_number": record.get("enrollment_number"),
@@ -419,6 +443,8 @@ def _profile_payload_from_record(record: Dict[str, Any]) -> Dict[str, Any]:
         "current_semester": record.get("current_semester"),
         "academic_year": record.get("academic_year") or "",
         "profile_completed": bool(record.get("profile_completed")),
+        "approval_status": enrollment_metadata.get("approval_status", "approved"),
+        "approval_notes": enrollment_metadata.get("approval_notes", ""),
     }
 
 
@@ -457,9 +483,102 @@ def _upsert_profile(record: Dict[str, Any]) -> Dict[str, Any]:
     return rows[0]
 
 
+def _auth_admin_request(method: str, path: str, *, json_body: Optional[Any] = None, expected: tuple[int, ...] = (200,)) -> Any:
+    _require_supabase_config(service_role=True)
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+    }
+    try:
+        response = requests.request(
+            method,
+            f"{SUPABASE_URL}/auth/v1{path}",
+            headers=headers,
+            json=json_body,
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(502, f"Supabase auth request failed: {exc}") from exc
+    if response.status_code not in expected:
+        raise HTTPException(response.status_code, response.text or response.reason)
+    if not response.content:
+        return None
+    return response.json()
+
+
+def _approval_status(record: Dict[str, Any]) -> str:
+    metadata = record.get("enrollment_metadata") or {}
+    return metadata.get("approval_status", "approved")
+
+
+def _set_approval_metadata(
+    record: Dict[str, Any],
+    *,
+    status: str,
+    notes: str = "",
+    approved_by: str = "",
+) -> Dict[str, Any]:
+    metadata = dict(record.get("enrollment_metadata") or {})
+    metadata["approval_status"] = status
+    metadata["approval_notes"] = notes
+    metadata["needs_admin_approval"] = status != "approved"
+    metadata["approved_at"] = _now() if status == "approved" else None
+    metadata["approved_by"] = approved_by or None
+    metadata["enrollment_lookup_found"] = bool(metadata.get("uid_number") or metadata.get("student_full_name"))
+    return metadata
+
+
 def _validate_problem_ids(problem_ids: List) -> List[str]:
     """Convert problem_ids to strings, handling both int and str inputs"""
     return [str(pid) for pid in problem_ids]
+
+
+def _normalize_video_title(url: str, fallback_index: int = 1) -> str:
+    parsed = urlparse(url)
+    last_part = Path(parsed.path.rstrip("/")).name.replace("-", " ").replace("_", " ").strip()
+    if last_part:
+        return last_part.title()
+    host = parsed.netloc.replace("www.", "") or "video"
+    return f"{host.title()} Video {fallback_index}"
+
+
+def _build_week_videos(videos: Optional[List[WeekVideoInput]], legacy_url: Optional[str], legacy_title: Optional[str]) -> List[Dict[str, str]]:
+    prepared: List[Dict[str, str]] = []
+    if videos:
+        for idx, video in enumerate(videos, start=1):
+            prepared.append({
+                "kind": "video",
+                "url": video.url.strip(),
+                "title": (video.title or "").strip() or _normalize_video_title(video.url, idx),
+            })
+    elif legacy_url:
+        prepared.append({
+            "kind": "video",
+            "url": legacy_url.strip(),
+            "title": (legacy_title or "").strip() or _normalize_video_title(legacy_url, 1),
+        })
+    return prepared
+
+
+def _split_week_resources(resource_files: Optional[List[Dict[str, Any]]]) -> tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+    files: List[Dict[str, Any]] = []
+    videos: List[Dict[str, str]] = []
+    for entry in resource_files or []:
+        if entry.get("kind") == "video" and entry.get("url"):
+            videos.append({
+                "url": entry["url"],
+                "title": entry.get("title") or _normalize_video_title(entry["url"], len(videos) + 1),
+            })
+        else:
+            files.append(entry)
+    return files, videos
+
+
+def _merge_week_resources(resource_files: Optional[List[Dict[str, Any]]], videos: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    merged = list(resource_files or [])
+    merged.extend({**video, "kind": "video"} for video in videos)
+    return merged
 
 
 def _resource_signed_url(path: str) -> str:
@@ -477,16 +596,22 @@ def _resource_signed_url(path: str) -> str:
 
 
 def _format_week(row: Dict[str, Any], include_signed_urls: bool = False) -> Dict[str, Any]:
-    resources = row.get("resource_files") or []
+    stored_resources = row.get("resource_files") or []
+    plain_resources, videos = _split_week_resources(stored_resources)
     if include_signed_urls:
         resources = [
             {**resource, "url": _resource_signed_url(resource.get("key", ""))}
-            for resource in resources
+            for resource in plain_resources
             if resource.get("key")
         ]
+    else:
+        resources = plain_resources
     # Convert problem_ids to strings for consistency
     problem_ids = row.get("problem_ids") or []
     problem_ids = [str(pid) for pid in problem_ids]
+    if not videos and row.get("video_url"):
+        videos = _build_week_videos(None, row.get("video_url"), row.get("video_description"))
+    primary_video = videos[0] if videos else None
     return {
         "id": row.get("id"),
         "title": row.get("title"),
@@ -495,8 +620,9 @@ def _format_week(row: Dict[str, Any], include_signed_urls: bool = False) -> Dict
         "topic": row.get("topic") or "",
         "semester": row.get("semester"),
         "academic_years": row.get("academic_years") or [],
-        "video_url": row.get("video_url"),
-        "video_description": row.get("video_description"),
+        "video_url": primary_video["url"] if primary_video else row.get("video_url"),
+        "video_description": primary_video["title"] if primary_video else row.get("video_description"),
+        "videos": videos,
         "display_order": row.get("display_order", 0),
         "problem_ids": problem_ids,
         "resource_files": resources,
@@ -512,6 +638,17 @@ def _format_week_list(row: Dict[str, Any]) -> Dict[str, Any]:
         "id": row.get("id"),
         "title": row.get("title"),
     }
+
+
+def _week_payload_from_request(req: WeekRequestFull) -> Dict[str, Any]:
+    payload = req.model_dump()
+    payload["problem_ids"] = _validate_problem_ids(payload["problem_ids"])
+    videos = _build_week_videos(req.videos, req.video_url, req.video_description)
+    payload["resource_files"] = _merge_week_resources(req.resource_files, videos)
+    payload["video_url"] = videos[0]["url"] if videos else ""
+    payload["video_description"] = videos[0]["title"] if videos else ""
+    payload.pop("videos", None)
+    return payload
 
 
 def _week_visible_to_profile(row: Dict[str, Any], profile: Optional[Dict[str, Any]]) -> bool:
@@ -740,6 +877,38 @@ public class Solution {{
         return "", str(e)
 
 
+def _run_c(code: str, test_input: str, problem_id: str = "") -> tuple[str, Optional[str]]:
+    """Compile and execute C code, return (stdout, stderr)."""
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            src_file = tmpdir_path / "solution.c"
+            exe_file = tmpdir_path / "solution.exe"
+            src_file.write_text(code, encoding="utf-8")
+            compile_result = subprocess.run(
+                ["gcc", str(src_file), "-O2", "-std=c11", "-o", str(exe_file)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if compile_result.returncode != 0:
+                return "", f"Compilation error: {compile_result.stderr}"
+            run_result = subprocess.run(
+                [str(exe_file)],
+                input=test_input,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            return run_result.stdout.strip(), run_result.stderr if run_result.returncode != 0 else None
+    except subprocess.TimeoutExpired:
+        return "", "Time limit exceeded"
+    except FileNotFoundError:
+        return "", "C compiler not found (gcc)"
+    except Exception as e:
+        return "", str(e)
+
+
 def _run_cpp(code: str, test_input: str, problem_id: str = "") -> tuple[str, Optional[str]]:
     """Compile and execute C++ code, return (stdout, stderr)."""
     try:
@@ -862,6 +1031,32 @@ rl.on('close', () => {{
         return "", "Node.js not found"
     except Exception as e:
         return "", str(e)
+
+
+def _execute_code_for_input(code: str, test_input: str, language: str) -> Dict[str, Any]:
+    normalized = (language or "").strip().lower()
+    start = time.perf_counter()
+    if normalized == "python":
+        output, error = _run_python(code, test_input)
+    elif normalized == "java":
+        output, error = _run_java(code, test_input)
+    elif normalized == "c":
+        output, error = _run_c(code, test_input)
+    elif normalized in ("cpp", "c++"):
+        output, error = _run_cpp(code, test_input)
+    elif normalized in ("javascript", "js", "node"):
+        output, error = _run_js(code, test_input)
+    else:
+        return {
+            "output": "",
+            "error": f"Unsupported execution language: {language}",
+            "runtime_ms": 0,
+        }
+    return {
+        "output": output,
+        "error": error,
+        "runtime_ms": round((time.perf_counter() - start) * 1000, 2),
+    }
 
 
 def _fake_output(code: str, test_input: str, language: str) -> str:
@@ -1140,6 +1335,14 @@ async def signup(req: SignupRequest):
     current_semester = req.current_semester or _infer_current_semester(enrollment_number)
     academic_year = req.academic_year or _academic_year_from_batch(_infer_batch_start_year(enrollment_number))
     profile_completed = bool(current_semester and academic_year)
+    is_bootstrap_admin = bool(BOOTSTRAP_ADMIN_ENROLLMENT and enrollment_number == BOOTSTRAP_ADMIN_ENROLLMENT.upper())
+    approval_status = "approved" if enrollment or is_bootstrap_admin else "pending"
+    approval_notes = "" if approval_status == "approved" else "Enrollment validation failed. Waiting for admin approval."
+    enrollment_metadata = _set_approval_metadata(
+        enrollment,
+        status=approval_status,
+        notes=approval_notes,
+    )
 
     auth_user = _supabase_request(
         "POST",
@@ -1150,10 +1353,11 @@ async def signup(req: SignupRequest):
             "password": req.password,
             "email_confirm": True,
             "user_metadata": {"enrollment_number": enrollment_number, "full_name": full_name},
+            "app_metadata": {"role": "admin" if is_bootstrap_admin else "student", "approval_status": approval_status},
         },
         expected=(200, 201),
     )
-    role = "admin" if BOOTSTRAP_ADMIN_ENROLLMENT and enrollment_number == BOOTSTRAP_ADMIN_ENROLLMENT.upper() else "student"
+    role = "admin" if is_bootstrap_admin else "student"
     profile = _upsert_profile({
         "id": auth_user["id"],
         "enrollment_number": enrollment_number,
@@ -1169,12 +1373,19 @@ async def signup(req: SignupRequest):
         "contact_no": enrollment.get("contact_no"),
         "address": enrollment.get("address"),
         "admission_date": enrollment.get("admission_date"),
-        "enrollment_metadata": enrollment,
+        "enrollment_metadata": enrollment_metadata,
         "is_placeholder_email": is_placeholder_email,
         "current_semester": current_semester,
         "academic_year": academic_year,
         "profile_completed": profile_completed,
     })
+    if approval_status != "approved":
+        return {
+            "token": None,
+            "refresh_token": None,
+            "user": _profile_payload_from_record(profile),
+            "message": "Signup completed and sent for admin approval.",
+        }
     token_payload = _supabase_request(
         "POST",
         "/auth/v1/token",
@@ -1191,9 +1402,11 @@ async def signup(req: SignupRequest):
 
 @app.post("/api/v1/auth/login")
 async def login(req: LoginRequest):
-    profile = _fetch_profile_by_enrollment(req.enrollment_number)
+    profile = _fetch_profile_by_enrollment(_normalize_enrollment_number(req.enrollment_number))
     if not profile or not profile.get("email"):
         raise HTTPException(401, "Invalid enrollment number or password")
+    if _approval_status(profile) != "approved":
+        raise HTTPException(403, "Your account is waiting for admin approval")
     token_payload = _supabase_request(
         "POST",
         "/auth/v1/token",
@@ -1297,8 +1510,7 @@ async def get_week(week_id: str, current: Dict[str, Any] = Depends(get_current_u
 @app.post("/api/v1/admin/weeks")
 async def create_week(req: WeekRequestFull, admin: Dict[str, Any] = Depends(require_admin)):
     """Create a new week with all details including semester and academic years"""
-    payload = req.model_dump()
-    payload["problem_ids"] = _validate_problem_ids(payload["problem_ids"])
+    payload = _week_payload_from_request(req)
     rows = _supabase_request(
         "POST",
         "/rest/v1/weeks",
@@ -1313,8 +1525,7 @@ async def create_week(req: WeekRequestFull, admin: Dict[str, Any] = Depends(requ
 @app.put("/api/v1/admin/weeks/{week_id}")
 async def update_week(week_id: str, req: WeekRequestFull, admin: Dict[str, Any] = Depends(require_admin)):
     """Update an existing week with all details"""
-    payload = req.model_dump()
-    payload["problem_ids"] = _validate_problem_ids(payload["problem_ids"])
+    payload = _week_payload_from_request(req)
     rows = _supabase_request(
         "PATCH",
         "/rest/v1/weeks",
@@ -1408,6 +1619,55 @@ async def list_students(
     ]
 
 
+@app.get("/api/v1/admin/students/pending-approval")
+async def list_pending_students(admin: Dict[str, Any] = Depends(require_admin)):
+    rows = _supabase_request(
+        "GET",
+        "/rest/v1/profiles",
+        service_role=True,
+        params={"select": "*"},
+    )
+    pending_rows = [row for row in rows if _approval_status(row) != "approved" and (row.get("role") or "student") == "student"]
+    return [
+        {
+            **_profile_payload_from_record(row),
+            "progress": _progress_for_profile(row),
+            "enrollment_metadata": row.get("enrollment_metadata") or {},
+        }
+        for row in pending_rows
+    ]
+
+
+@app.post("/api/v1/admin/students/{student_id}/approve")
+async def approve_student(
+    student_id: str,
+    req: StudentApprovalRequest,
+    admin: Dict[str, Any] = Depends(require_admin),
+):
+    profile = _fetch_profile_by_user_id(student_id)
+    if not profile:
+        raise HTTPException(404, "Student not found")
+    if (profile.get("role") or "student") != "student":
+        raise HTTPException(400, "Only student accounts can be approved")
+
+    approval_metadata = _set_approval_metadata(
+        profile,
+        status="approved",
+        notes=req.notes or "Approved by admin",
+        approved_by=admin["profile"].get("enrollment_number") or admin["profile"].get("id") or "",
+    )
+    updated = _upsert_profile({**profile, "enrollment_metadata": approval_metadata})
+    _auth_admin_request(
+        "PUT",
+        f"/admin/users/{student_id}",
+        json_body={"app_metadata": {"role": "student", "approval_status": "approved"}},
+    )
+    return {
+        "message": "Student approved successfully",
+        "student": _profile_payload_from_record(updated),
+    }
+
+
 @app.post("/api/v1/admin/students/bulk-semester")
 async def bulk_update_semester(req: BulkSemesterUpdateRequest, admin: Dict[str, Any] = Depends(require_admin)):
     params: Dict[str, Any] = {"current_semester": f"eq.{req.from_semester}"}
@@ -1426,10 +1686,13 @@ async def bulk_update_semester(req: BulkSemesterUpdateRequest, admin: Dict[str, 
 
 @app.post("/api/v1/admin/problem-generation")
 async def generate_problems(req: ProblemGenerationRequest, admin: Dict[str, Any] = Depends(require_admin)):
-    if AI_PROVIDER not in ("openai", "gemini") or not AI_API_KEY:
+    if not _ai_enabled():
         return _fallback_problem_generation(req)
     system = """You are an expert competitive programming and DSA problem setter.
-Analyze lecture context and generate interview-quality LeetCode-style coding problems at the specified difficulty level.
+Read the subject, semester, topic, and transcript carefully before writing anything.
+Generate interview-quality original coding problems at the specified difficulty level.
+Do not generate a problem that is the same as, or a thin rewrite of, a well-known LeetCode, HackerRank, Codeforces, GeeksforGeeks, or other publicly common problem.
+Use the lecture context to create a fresh scenario, constraints, and test structure.
 Return strictly valid JSON in this exact shape:
 {
 "subject": "",
@@ -1458,6 +1721,8 @@ Rules:
 - Include non-trivial edge cases
 - Relate directly to the topic
 - Generate UNIQUE problems (never duplicate the provided titles)
+- First analyze the transcript and semester depth to match the right complexity and prerequisite knowledge
+- Avoid direct clones, renamed clones, or standard famous textbook problems
 - All problems MUST be at the specified difficulty level
 - Generate 2-3 distinct problems at this difficulty"""
     
@@ -1584,9 +1849,191 @@ def _call_ai_json(messages: List[Dict[str, str]]) -> Dict[str, Any]:
     raise RuntimeError(f"Unsupported AI_PROVIDER: {AI_PROVIDER}")
 
 
+def _ai_enabled() -> bool:
+    return AI_PROVIDER in ("openai", "gemini") and bool(AI_API_KEY)
+
+
+def _build_basic_test_cases(problem: Dict[str, Any]) -> List[Dict[str, str]]:
+    inputs = problem.get("sample_inputs") or []
+    outputs = problem.get("sample_outputs") or []
+    cases: List[Dict[str, str]] = []
+    for index, sample_input in enumerate(inputs):
+        expected_output = outputs[index] if index < len(outputs) else ""
+        cases.append({
+            "name": f"sample_{index + 1}",
+            "input": str(sample_input),
+            "expected_output": str(expected_output),
+            "reason": "Sample test case from the problem statement.",
+        })
+    return cases
+
+
+def _generate_ai_test_cases(problem: Dict[str, Any], language: str, solution: str) -> List[Dict[str, str]]:
+    fallback_cases = _build_basic_test_cases(problem)
+    if not _ai_enabled():
+        return fallback_cases
+    prompt = [
+        {
+            "role": "system",
+            "content": (
+                "You are a strict competitive-programming reviewer. "
+                "Read the problem fully before creating tests. "
+                "Return only JSON with key test_cases. "
+                "Each test case must contain: name, input, expected_output, reason. "
+                "Create 5 to 8 meaningful tests including edge cases, boundaries, and tricky cases."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "problem": {
+                        "id": problem.get("id"),
+                        "title": problem.get("title"),
+                        "description": problem.get("description"),
+                        "difficulty": problem.get("difficulty"),
+                        "sample_inputs": problem.get("sample_inputs"),
+                        "sample_outputs": problem.get("sample_outputs"),
+                        "constraints": problem.get("constraints"),
+                        "input_format": problem.get("input_format"),
+                        "output_format": problem.get("output_format"),
+                    },
+                    "language": language,
+                    "solution_preview": solution[:2000],
+                },
+                ensure_ascii=True,
+            ),
+        },
+    ]
+    try:
+        payload = _call_ai_json(prompt)
+        cases = payload.get("test_cases") or []
+        normalized: List[Dict[str, str]] = []
+        for index, case in enumerate(cases, start=1):
+            case_input = str(case.get("input", "")).strip()
+            expected_output = str(case.get("expected_output", "")).strip()
+            if not case_input or expected_output == "":
+                continue
+            normalized.append({
+                "name": str(case.get("name") or f"ai_case_{index}"),
+                "input": case_input,
+                "expected_output": expected_output,
+                "reason": str(case.get("reason") or "AI-generated validation case."),
+            })
+        return normalized or fallback_cases
+    except Exception as exc:
+        logger.warning(f"AI test generation failed: {exc}")
+        return fallback_cases
+
+
+def _ai_review_results(problem: Dict[str, Any], language: str, solution: str, case_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    summary = {
+        "verdict": "accepted" if case_results and all(case["passed"] for case in case_results) else "wrong_answer",
+        "total_test_cases": len(case_results),
+        "passed_test_cases": sum(1 for case in case_results if case["passed"]),
+        "language": language,
+    }
+    if not _ai_enabled():
+        return {
+            **summary,
+            "review_notes": "AI provider is not configured. Returning execution-based verification only.",
+            "test_cases": case_results,
+        }
+    try:
+        payload = _call_ai_json(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are reviewing a coding submission. "
+                        "Return only JSON with keys verdict, summary, and test_cases. "
+                        "For each test case include name, passed, input, expected_output, received_output, hint, error. "
+                        "Hints must be short and specific."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "problem": {
+                                "id": problem.get("id"),
+                                "title": problem.get("title"),
+                                "description": problem.get("description"),
+                            },
+                            "language": language,
+                            "solution": solution,
+                            "execution_results": case_results,
+                        },
+                        ensure_ascii=True,
+                    ),
+                },
+            ]
+        )
+        reviewed_cases = payload.get("test_cases") or case_results
+        return {
+            "verdict": payload.get("verdict") or summary["verdict"],
+            "summary": payload.get("summary") or "",
+            "total_test_cases": len(reviewed_cases),
+            "passed_test_cases": sum(1 for case in reviewed_cases if case.get("passed")),
+            "language": language,
+            "test_cases": reviewed_cases,
+        }
+    except Exception as exc:
+        logger.warning(f"AI review failed: {exc}")
+        return {
+            **summary,
+            "review_notes": f"AI review failed, returning execution-based verification only: {exc}",
+            "test_cases": case_results,
+        }
+
+
+async def _verify_problem_solution(problem_id: str, solution: str, language: str) -> Dict[str, Any]:
+    problem = await get_problem(problem_id)
+    test_cases = _generate_ai_test_cases(problem, language, solution)
+    execution_results: List[Dict[str, Any]] = []
+    for case in test_cases:
+        execution = _execute_code_for_input(solution, case["input"], language)
+        execution_results.append(
+            {
+                "name": case["name"],
+                "input": case["input"],
+                "expected_output": case["expected_output"],
+                "received_output": execution["output"],
+                "passed": (execution["output"] or "").strip() == case["expected_output"].strip() and not execution["error"],
+                "error": execution["error"],
+                "hint": None,
+                "reason": case.get("reason", ""),
+                "runtime_ms": execution.get("runtime_ms", 0),
+            }
+        )
+    return _ai_review_results(problem, language, solution, execution_results)
+
+
+def _fallback_starter_code(req: StarterCodeRequest) -> Dict[str, str]:
+    slug_hint = re.sub(r"[^a-zA-Z0-9]+", "_", req.problem_name).strip("_").lower() or "solution"
+    c_code = f"""#include <stdio.h>
+
+int main(void) {{
+    /* TODO: solve {req.problem_name} */
+    return 0;
+}}
+"""
+    java_code = f"""import java.util.*;
+
+public class Solution {{
+    public static void main(String[] args) {{
+        Scanner sc = new Scanner(System.in);
+        // TODO: solve {req.problem_name}
+        sc.close();
+    }}
+}}
+"""
+    return {"c": c_code, "java": java_code, "slug_hint": slug_hint}
+
+
 @app.post("/api/v1/admin/suggestions")
 async def create_suggestion(req: SuggestionRequest, admin: Dict[str, Any] = Depends(require_admin)):
-    if AI_PROVIDER not in ("openai", "gemini") or not AI_API_KEY:
+    if not _ai_enabled():
         return {"suggestions": _fallback_suggestion(req), "warning": "AI provider is not configured"}
     if req.suggestion_type in ("title", "description", "all"):
         system = (
@@ -1614,6 +2061,45 @@ async def create_suggestion(req: SuggestionRequest, admin: Dict[str, Any] = Depe
             "suggestions": _fallback_suggestion(req),
             "warning": f"AI provider failed, fallback returned: {exc}",
         }
+
+
+@app.post("/api/v1/problems/starter-code")
+async def generate_starter_code(req: StarterCodeRequest, admin: Dict[str, Any] = Depends(require_admin)):
+    if not _ai_enabled():
+        return _fallback_starter_code(req)
+    try:
+        payload = _call_ai_json(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You generate starter code for competitive programming problems. "
+                        "Return only JSON with keys c and java. "
+                        "Both starter codes must read stdin, leave TODO comments, and not include the final solution."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "problem_name": req.problem_name,
+                            "description": req.description,
+                            "input_format": req.input_format,
+                            "output_format": req.output_format,
+                        },
+                        ensure_ascii=True,
+                    ),
+                },
+            ]
+        )
+        return {
+            "c": payload.get("c") or _fallback_starter_code(req)["c"],
+            "java": payload.get("java") or _fallback_starter_code(req)["java"],
+        }
+    except Exception as exc:
+        fallback = _fallback_starter_code(req)
+        fallback["warning"] = f"AI generation failed, fallback returned: {exc}"
+        return fallback
 
 
 @app.get("/api/v1/problems")
@@ -1677,71 +2163,25 @@ async def create_problem(problem: Dict[str, Any], admin: Dict[str, Any] = Depend
     return rows[0]
 
 
+@app.post("/api/v1/problems/{problem_id}/verify-solution")
+async def verify_problem_solution(problem_id: str, req: SolutionVerificationRequest):
+    if req.problem_id != problem_id:
+        raise HTTPException(400, "problem_id in path and body must match")
+    return await _verify_problem_solution(problem_id, req.solution, req.language)
+
+
 @app.post("/api/v1/check", response_model=CheckResult)
 async def check_local(req: CheckRequest):
-    """Run check50 on public tests and persist a temporary submission."""
-    problem = await get_problem(req.problem_id)
-    if not problem:
-        raise HTTPException(404, f"Problem '{req.problem_id}' not found")
-
-    # Try check50 first, fall back to custom validator if it fails
-    slug = problem.get("check_slug", f"github.com/yourclub/checks/{req.problem_id}")
-    
-    try:
-        execution = await run_check50_async(
-            code=req.code,
-            language=req.language,
-            problem_id=req.problem_id,
-            check_slug=slug,
-            offline=os.getenv("CHECK50_OFFLINE_MODE", "true").lower() == "true"
-        )
-        logger.info(f"check50 execution succeeded for problem {req.problem_id}")
-    except Exception as e:
-        logger.warning(f"check50 failed for problem {req.problem_id}: {e}, falling back to custom validator")
-        # Fall back to custom validator
-        check_dir = Path(__file__).parent.parent / "checks" / str(req.problem_id)
-        try:
-            execution = await run_custom_checks(
-                code=req.code,
-                language=req.language,
-                problem_id=req.problem_id,
-                check_dir=check_dir,
-            )
-            logger.info(f"Custom validator succeeded for problem {req.problem_id}")
-        except Exception as e2:
-            logger.error(f"Both check50 and custom validator failed: {e2}")
-            raise HTTPException(500, f"Failed to run checks: {str(e2)}")
-
-    passed = execution["passed"]
-    results = execution["results"]
-    score = int((passed / len(results)) * problem["points"]) if results else 0
-    verdict = "accepted" if passed == len(results) else "wrong_answer"
+    """Verify a solution against generated and sample test cases."""
+    verification = await _verify_problem_solution(req.problem_id, req.code, req.language)
     sub_id = _short_id()
-    _create_submission_record(
-        sub_id=sub_id,
-        problem_id=req.problem_id,
-        username="local",
-        code=req.code,
-        language=req.language,
-        status=verdict,
-        verdict=verdict,
-        score=score,
-        max_score=problem["points"],
-        public_results=results,
-        hidden_results=[],
-        compilation_output="Compilation successful.",
-        submitted_at=_now(),
-        finished_at=_now(),
-        temp_submission=True,
-    )
-
     return CheckResult(
         problem_id=req.problem_id,
         language=req.language,
-        results=results,
-        passed=passed,
-        total=len(results),
-        compilation_output="Compilation successful.",
+        results=verification.get("test_cases", []),
+        passed=verification.get("passed_test_cases", 0),
+        total=verification.get("total_test_cases", 0),
+        compilation_output=verification.get("summary") or verification.get("review_notes") or "",
         submission_id=sub_id,
         tracking_url=f"https://club50.dev/submissions/{sub_id}",
     )
@@ -1749,18 +2189,21 @@ async def check_local(req: CheckRequest):
 
 @app.post("/api/v1/submissions", response_model=SubmissionResponse)
 async def create_submission(
-    background_tasks: BackgroundTasks,
     problem_id: str = Form(...),
     username: str = Form(...),
     language: str = Form("python"),
     code: str = Form(...),
 ):
-    """Accept a submission and queue background validation."""
+    """Check a submission first, then persist the final result."""
     problem = await get_problem(problem_id)
     if not problem:
         raise HTTPException(404, f"Problem '{problem_id}' not found")
 
+    verification = await _verify_problem_solution(problem_id, code, language)
     sub_id = _short_id()
+    score = int(
+        (verification.get("passed_test_cases", 0) / max(verification.get("total_test_cases", 1), 1)) * problem.get("points", 100)
+    ) if verification.get("total_test_cases", 0) else 0
     SUBMISSIONS[sub_id] = {
         "id": sub_id,
         "username": username,
@@ -1768,28 +2211,40 @@ async def create_submission(
         "problem_title": problem["title"],
         "language": language,
         "code": code,
-        "status": "queued",
-        "verdict": None,
-        "score": 0,
+        "status": verification.get("verdict", "wrong_answer"),
+        "verdict": verification.get("verdict", "wrong_answer"),
+        "score": score,
         "max_score": problem["points"],
-        "runtime_ms": None,
+        "runtime_ms": max((case.get("runtime_ms", 0) for case in verification.get("test_cases", [])), default=0),
         "memory_kb": None,
-        "public_results": [],
+        "public_results": verification.get("test_cases", []),
         "hidden_results": [],
-        "compilation_output": "",
+        "compilation_output": verification.get("summary") or verification.get("review_notes") or "",
         "submitted_at": _now(),
-        "finished_at": None,
+        "finished_at": _now(),
         "updated_at": _now(),
         "leaderboard_rank": None,
     }
-
-    background_tasks.add_task(_process_submission, sub_id)
+    key = f"{username}::{problem_id}"
+    existing = LEADERBOARD.get(key, {}).get("score", -1)
+    if score >= existing:
+        LEADERBOARD[key] = {
+            "username": username,
+            "problem_id": problem_id,
+            "problem_title": problem["title"],
+            "score": score,
+            "max_score": problem["points"],
+            "verdict": verification.get("verdict", "wrong_answer"),
+            "runtime_ms": SUBMISSIONS[sub_id]["runtime_ms"],
+            "submission_id": sub_id,
+            "submitted_at": SUBMISSIONS[sub_id]["submitted_at"],
+        }
 
     return SubmissionResponse(
         submission_id=sub_id,
-        status="queued",
+        status=verification.get("verdict", "wrong_answer"),
         tracking_url=f"https://club50.dev/submissions/{sub_id}",
-        message="Submission received successfully.",
+        message="Submission checked and stored successfully.",
     )
 
 
