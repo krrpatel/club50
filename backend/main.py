@@ -11,6 +11,7 @@ import logging
 import os
 import random
 import re
+import shutil
 import string
 import subprocess
 import tempfile
@@ -863,6 +864,57 @@ def _simulate_run(code: str, test_input: str, language: str, problem_id: str = "
         return {"output": "", "runtime_ms": 0, "memory_kb": 0, "error": str(exc)}
 
 
+def _resolve_binary(binary_name: str, windows_roots: Optional[List[Path]] = None) -> str:
+    direct = shutil.which(binary_name)
+    if direct:
+        return direct
+
+    env_home = ""
+    if binary_name in ("java", "javac"):
+        env_home = os.getenv("JAVA_HOME", "").strip()
+    elif binary_name == "gcc":
+        env_home = os.getenv("GCC_HOME", "").strip()
+
+    if env_home:
+        candidate = Path(env_home) / "bin" / f"{binary_name}.exe"
+        if candidate.exists():
+            return str(candidate)
+        candidate = Path(env_home) / "bin" / binary_name
+        if candidate.exists():
+            return str(candidate)
+
+    for root in windows_roots or []:
+        if not root.exists():
+            continue
+        matches = sorted(root.glob(f"**/{binary_name}.exe"), reverse=True)
+        if matches:
+            return str(matches[0])
+
+    raise FileNotFoundError(f"{binary_name} not found")
+
+
+def _resolve_java_binary(binary_name: str) -> str:
+    return _resolve_binary(
+        binary_name,
+        windows_roots=[
+            Path("C:/Program Files/Eclipse Adoptium"),
+            Path("C:/Program Files/Java"),
+            Path("C:/Program Files (x86)/Java"),
+        ],
+    )
+
+
+def _resolve_c_compiler() -> str:
+    return _resolve_binary(
+        "gcc",
+        windows_roots=[
+            Path("C:/msys64"),
+            Path("C:/mingw64"),
+            Path("C:/mingw32"),
+        ],
+    )
+
+
 def _run_python(code: str, test_input: str, problem_id: str = "") -> tuple[str, Optional[str]]:
     """Execute Python code and return (stdout, stderr)."""
     try:
@@ -915,6 +967,8 @@ def _run_java(code: str, test_input: str, problem_id: str = "") -> tuple[str, Op
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)
+            javac_bin = _resolve_java_binary("javac")
+            java_bin = _resolve_java_binary("java")
             
             # Wrap user code if it's just a method
             if "public static void main" not in code:
@@ -971,7 +1025,7 @@ public class Solution {{
             
             # Compile
             compile_result = subprocess.run(
-                ['javac', str(src_file)],
+                [javac_bin, str(src_file)],
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -982,7 +1036,7 @@ public class Solution {{
             
             # Run
             run_result = subprocess.run(
-                ['java', '-cp', str(tmpdir), 'Solution'],
+                [java_bin, '-cp', str(tmpdir), 'Solution'],
                 input=test_input,
                 capture_output=True,
                 text=True,
@@ -1003,11 +1057,12 @@ def _run_c(code: str, test_input: str, problem_id: str = "") -> tuple[str, Optio
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir_path = Path(tmpdir)
+            gcc_bin = _resolve_c_compiler()
             src_file = tmpdir_path / "solution.c"
             exe_file = tmpdir_path / "solution.exe"
             src_file.write_text(code, encoding="utf-8")
             compile_result = subprocess.run(
-                ["gcc", str(src_file), "-O2", "-std=c11", "-o", str(exe_file)],
+                [gcc_bin, str(src_file), "-O2", "-std=c11", "-o", str(exe_file)],
                 capture_output=True,
                 text=True,
                 timeout=10,
