@@ -1102,7 +1102,8 @@ def _java_wrapper_from_plan(plan: Dict[str, Any], runner_class: str = "Runner") 
     params = plan.get("params") or []
     setup_lines = [
         "String raw = new String(System.in.readAllBytes()).trim();",
-        'String normalized = raw.replace("[", " ").replace("]", " ").trim();',
+        'String normalized = raw.replaceAll("[A-Za-z_][A-Za-z0-9_]*\\\\s*=", " ");',
+        'normalized = normalized.replace("[", " ").replace("]", " ").trim();',
         'String[] commaTokens = normalized.isEmpty() ? new String[0] : normalized.split("\\\\s*,\\\\s*");',
         'String[] lineTokens = raw.split("\\\\R");',
     ]
@@ -1128,7 +1129,7 @@ def _java_wrapper_from_plan(plan: Dict[str, Any], runner_class: str = "Runner") 
         elif kind == "int":
             source_index = int_index
             setup_lines.append(
-                f'int {name} = Integer.parseInt((lineTokens.length > {source_index} ? lineTokens[{source_index}] : normalized).replace("[", "").replace("]", "").trim().split(",")[0].trim());'
+                f'int {name} = Integer.parseInt((lineTokens.length > {source_index} ? lineTokens[{source_index}] : normalized).replaceAll("[A-Za-z_][A-Za-z0-9_]*\\\\s*=", " ").replace("[", "").replace("]", "").trim().split(",")[0].trim());'
             )
             call_args.append(name)
             int_index += 1
@@ -1165,6 +1166,7 @@ def _c_wrapper_from_plan(plan: Dict[str, Any]) -> str:
         "char buffer[65536];",
         "if (!fgets(buffer, sizeof(buffer), stdin)) { return 0; }",
         'const char *delims = "[], \\n\\r\\t";',
+        'for (char *p = buffer; *p; ++p) { if (*p == \'=\') { *p = \' \'; } }',
     ]
     call_args: List[str] = []
     array_name = ""
@@ -1369,6 +1371,11 @@ int main(void) {{
     char buffer[65536];
     if (!fgets(buffer, sizeof(buffer), stdin)) {{
         return 0;
+    }}
+    for (char *p = buffer; *p; ++p) {{
+        if (*p == '=') {{
+            *p = ' ';
+        }}
     }}
 
     int nums[8192];
@@ -2480,7 +2487,7 @@ def _ai_review_results(problem: Dict[str, Any], language: str, solution: str, ca
     if not _ai_enabled():
         return {
             **summary,
-            "review_notes": "AI provider is not configured. Returning execution-based verification only.",
+            "review_notes": "",
             "test_cases": case_results,
         }
     try:
@@ -2526,7 +2533,7 @@ def _ai_review_results(problem: Dict[str, Any], language: str, solution: str, ca
         logger.warning(f"AI review failed: {exc}")
         return {
             **summary,
-            "review_notes": f"AI review failed, returning execution-based verification only: {exc}",
+            "review_notes": "",
             "test_cases": case_results,
         }
 
