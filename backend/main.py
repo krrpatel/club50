@@ -244,6 +244,10 @@ class SolutionVerificationRequest(BaseModel):
 class StudentApprovalRequest(BaseModel):
     notes: Optional[str] = ""
 
+
+class VideoTitleRequest(BaseModel):
+    url: str = Field(..., min_length=1)
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -579,6 +583,122 @@ def _merge_week_resources(resource_files: Optional[List[Dict[str, Any]]], videos
     merged = list(resource_files or [])
     merged.extend({**video, "kind": "video"} for video in videos)
     return merged
+
+
+def _extract_problem_templates(problem_payload: Dict[str, Any]) -> Dict[str, str]:
+    templates: Dict[str, str] = {}
+    template_items = problem_payload.get("templates") or problem_payload.get("problem_templates") or []
+    if isinstance(template_items, list):
+        for item in template_items:
+            language = (item.get("language") or "").strip().lower()
+            starter_code = item.get("starter_code")
+            if language and isinstance(starter_code, str):
+                templates[language] = starter_code
+
+    direct_starter = problem_payload.get("starter_code")
+    if isinstance(direct_starter, dict):
+        for language, code in direct_starter.items():
+            if isinstance(code, str) and code.strip():
+                templates[str(language).strip().lower()] = code
+
+    for language in ("c", "java"):
+        direct_key = f"{language}_starter_code"
+        if isinstance(problem_payload.get(direct_key), str) and problem_payload[direct_key].strip():
+            templates[language] = problem_payload[direct_key]
+
+    return templates
+
+
+def _normalize_problem_payload(problem_payload: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, str]]:
+    payload = dict(problem_payload)
+    if "statement" in payload and "description" not in payload:
+        payload["description"] = payload.pop("statement")
+
+    sample_inputs = payload.get("sample_inputs")
+    if isinstance(sample_inputs, str):
+        payload["sample_inputs"] = [sample_inputs]
+    elif sample_inputs is None:
+        payload["sample_inputs"] = []
+
+    sample_outputs = payload.get("sample_outputs")
+    if isinstance(sample_outputs, str):
+        payload["sample_outputs"] = [sample_outputs]
+    elif sample_outputs is None:
+        payload["sample_outputs"] = []
+
+    templates = _extract_problem_templates(payload)
+    payload.pop("templates", None)
+    payload.pop("problem_templates", None)
+    payload.pop("starter_code", None)
+    payload.pop("c_starter_code", None)
+    payload.pop("java_starter_code", None)
+    return payload, templates
+
+
+def _fetch_problem_templates(problem_id: int) -> List[Dict[str, Any]]:
+    return _supabase_request(
+        "GET",
+        "/rest/v1/problem_templates",
+        service_role=True,
+        params={
+            "problem_id": f"eq.{problem_id}",
+            "select": "id,problem_id,language,starter_code,solution_code,created_at",
+        },
+    )
+
+
+def _upsert_problem_templates(problem_id: int, templates: Dict[str, str]) -> List[Dict[str, Any]]:
+    normalized_templates = [
+        {
+            "problem_id": problem_id,
+            "language": language,
+            "starter_code": code,
+        }
+        for language, code in templates.items()
+        if code and language in ("c", "java")
+    ]
+    if not normalized_templates:
+        return _fetch_problem_templates(problem_id)
+
+    languages = ",".join(item["language"] for item in normalized_templates)
+    _supabase_request(
+        "DELETE",
+        "/rest/v1/problem_templates",
+        service_role=True,
+        params={
+            "problem_id": f"eq.{problem_id}",
+            "language": f"in.({languages})",
+        },
+        headers={"Prefer": "return=minimal"},
+    )
+    return _supabase_request(
+        "POST",
+        "/rest/v1/problem_templates",
+        service_role=True,
+        json_body=normalized_templates,
+        headers={"Prefer": "return=representation"},
+    )
+
+
+def _format_problem_response(problem_row: Dict[str, Any], templates: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    response = dict(problem_row, id=str(problem_row["id"]))
+    template_rows = templates if templates is not None else _fetch_problem_templates(int(problem_row["id"]))
+    response["templates"] = [
+        {
+            "id": row.get("id"),
+            "language": row.get("language"),
+            "starter_code": row.get("starter_code") or "",
+        }
+        for row in template_rows
+    ]
+    response["starter_code"] = {
+        row.get("language"): row.get("starter_code") or ""
+        for row in template_rows
+        if row.get("language") in ("c", "java")
+    }
+    response["sample_inputs"] = response.get("sample_inputs") or []
+    response["sample_outputs"] = response.get("sample_outputs") or []
+    return response
 
 
 def _resource_signed_url(path: str) -> str:
@@ -1808,6 +1928,10 @@ def _fallback_problem_generation(req: ProblemGenerationRequest) -> Dict[str, Any
     }
 
 
+def _fallback_video_title(url: str) -> str:
+    return _normalize_video_title(url, 1)
+
+
 def _call_openai_json(messages: List[Dict[str, str]]) -> Dict[str, Any]:
     response = requests.post(
         "https://api.openai.com/v1/chat/completions",
@@ -2011,20 +2135,36 @@ async def _verify_problem_solution(problem_id: str, solution: str, language: str
 
 def _fallback_starter_code(req: StarterCodeRequest) -> Dict[str, str]:
     slug_hint = re.sub(r"[^a-zA-Z0-9]+", "_", req.problem_name).strip("_").lower() or "solution"
+    method_name_parts = [part for part in re.split(r"[^a-zA-Z0-9]+", req.problem_name) if part]
+    camel_method = "".join(part.capitalize() for part in method_name_parts) or "SolveProblem"
+    java_method = camel_method[0].lower() + camel_method[1:] if camel_method else "solveProblem"
     c_code = f"""#include <stdio.h>
+#include <stdlib.h>
 
-int main(void) {{
-    /* TODO: solve {req.problem_name} */
+/*
+Input format:
+{req.input_format}
+
+Output format:
+{req.output_format}
+*/
+
+int {slug_hint}(void) {{
+    /* TODO: implement the core logic for {req.problem_name} */
     return 0;
 }}
 """
-    java_code = f"""import java.util.*;
+    java_code = f"""public class Solution {{
+    /*
+    Input format:
+    {req.input_format}
 
-public class Solution {{
-    public static void main(String[] args) {{
-        Scanner sc = new Scanner(System.in);
-        // TODO: solve {req.problem_name}
-        sc.close();
+    Output format:
+    {req.output_format}
+    */
+    public static int {java_method}() {{
+        // TODO: implement the core logic for {req.problem_name}
+        return 0;
     }}
 }}
 """
@@ -2063,6 +2203,40 @@ async def create_suggestion(req: SuggestionRequest, admin: Dict[str, Any] = Depe
         }
 
 
+@app.post("/api/v1/videos/generate-title")
+async def generate_video_title(req: VideoTitleRequest, admin: Dict[str, Any] = Depends(require_admin)):
+    fallback_title = _fallback_video_title(req.url)
+    if not _ai_enabled():
+        return {"title": fallback_title}
+    try:
+        payload = _call_ai_json(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You create short clean titles for educational video links. "
+                        "Return only JSON with a single key title. "
+                        "Do not add quotes, numbering, or explanations."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "video_url": req.url,
+                            "fallback_title": fallback_title,
+                            "goal": "Generate a human-friendly teaching video title for a course week.",
+                        },
+                        ensure_ascii=True,
+                    ),
+                },
+            ]
+        )
+        return {"title": (payload.get("title") or "").strip() or fallback_title}
+    except Exception as exc:
+        return {"title": fallback_title, "warning": f"AI title generation failed, fallback returned: {exc}"}
+
+
 @app.post("/api/v1/problems/starter-code")
 async def generate_starter_code(req: StarterCodeRequest, admin: Dict[str, Any] = Depends(require_admin)):
     if not _ai_enabled():
@@ -2075,7 +2249,10 @@ async def generate_starter_code(req: StarterCodeRequest, admin: Dict[str, Any] =
                     "content": (
                         "You generate starter code for competitive programming problems. "
                         "Return only JSON with keys c and java. "
-                        "Both starter codes must read stdin, leave TODO comments, and not include the final solution."
+                        "Generate function or method skeleton starter code, not console-runner boilerplate. "
+                        "Use the problem name, input format, output format, and description to infer a clean method signature. "
+                        "C code should expose a core function skeleton. Java code should expose a Solution class with a method skeleton. "
+                        "Do not include a full solved implementation."
                     ),
                 },
                 {
@@ -2111,15 +2288,18 @@ async def list_problems():
         params={"select": "id,slug,title,description,difficulty,points,time_limit,memory_limit,tags,sample_inputs,sample_outputs"}
     )
     # Convert numeric IDs to strings for frontend consistency
-    return [dict(row, id=str(row["id"])) for row in rows]
+    return [
+        {
+            **dict(row, id=str(row["id"])),
+            "sample_inputs": row.get("sample_inputs") or [],
+            "sample_outputs": row.get("sample_outputs") or [],
+        }
+        for row in rows
+    ]
 
 
 @app.get("/api/v1/problems/{problem_id}")
 async def get_problem(problem_id: str):
-    # Try to find by numeric ID first, then by slug
-    filter_col = "id"
-    filter_value = problem_id
-    
     # Try as numeric ID first
     try:
         numeric_id = int(problem_id)
@@ -2131,7 +2311,7 @@ async def get_problem(problem_id: str):
         )
         if rows:
             row = rows[0]
-            return dict(row, id=str(row["id"]))
+            return _format_problem_response(row)
     except ValueError:
         pass
     
@@ -2145,22 +2325,41 @@ async def get_problem(problem_id: str):
     if not rows:
         raise HTTPException(404, "Problem not found")
     row = rows[0]
-    return dict(row, id=str(row["id"]))
+    return _format_problem_response(row)
 
 @app.post("/api/v1/problems")
 async def create_problem(problem: Dict[str, Any], admin: Dict[str, Any] = Depends(require_admin)):
-    # Map AI generated 'statement' to 'description' if necessary
-    if "statement" in problem and "description" not in problem:
-        problem["description"] = problem.pop("statement")
-        
+    payload, templates = _normalize_problem_payload(problem)
     rows = _supabase_request(
         "POST",
         "/rest/v1/problems",
         service_role=True,
-        json_body=problem,
+        json_body=payload,
         headers={"Prefer": "return=representation"}
     )
-    return rows[0]
+    created_problem = rows[0]
+    template_rows = _upsert_problem_templates(int(created_problem["id"]), templates)
+    return _format_problem_response(created_problem, template_rows)
+
+
+@app.put("/api/v1/problems/{problem_id}")
+async def update_problem(problem_id: str, problem: Dict[str, Any], admin: Dict[str, Any] = Depends(require_admin)):
+    existing_problem = await get_problem(problem_id)
+    numeric_problem_id = int(existing_problem["id"])
+    payload, templates = _normalize_problem_payload(problem)
+    rows = _supabase_request(
+        "PATCH",
+        "/rest/v1/problems",
+        service_role=True,
+        json_body=payload,
+        params={"id": f"eq.{numeric_problem_id}"},
+        headers={"Prefer": "return=representation"},
+    )
+    if not rows:
+        raise HTTPException(404, "Problem not found")
+    updated_problem = rows[0]
+    template_rows = _upsert_problem_templates(numeric_problem_id, templates)
+    return _format_problem_response(updated_problem, template_rows)
 
 
 @app.post("/api/v1/problems/{problem_id}/verify-solution")
