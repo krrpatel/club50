@@ -632,6 +632,7 @@ def _normalize_problem_payload(problem_payload: Dict[str, Any]) -> tuple[Dict[st
     payload.pop("starter_code", None)
     payload.pop("c_starter_code", None)
     payload.pop("java_starter_code", None)
+    payload.pop("allowed_languages", None)
     return payload, templates
 
 
