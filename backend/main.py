@@ -1176,10 +1176,14 @@ def _java_wrapper_from_plan(plan: Dict[str, Any], runner_class: str = "Runner") 
         'normalized = normalized.replace("[", " ").replace("]", " ").trim();',
         'String[] commaTokens = normalized.isEmpty() ? new String[0] : normalized.split("\\\\s*,\\\\s*");',
         'String[] lineTokens = raw.split("\\\\R");',
+        'String[] numberTokens = normalized.isEmpty() ? new String[0] : normalized.split("[^0-9-]+");',
+        'java.util.List<Integer> parsedNumbers = new java.util.ArrayList<>();',
+        'for (String token : numberTokens) { if (token != null && !token.isBlank()) { parsedNumbers.add(Integer.parseInt(token.trim())); } }',
     ]
     call_args: List[str] = []
     array_name = ""
     int_index = 0
+    has_int_array = any(param.get("kind") == "int_array" for param in params)
     for param in params:
         kind = param.get("kind")
         name = param.get("name") or f"arg{len(call_args)}"
@@ -1187,8 +1191,10 @@ def _java_wrapper_from_plan(plan: Dict[str, Any], runner_class: str = "Runner") 
             array_name = name
             setup_lines.extend(
                 [
-                    f"int[] {name} = new int[commaTokens.length];",
-                    f"for (int i = 0; i < commaTokens.length; i++) {{ {name}[i] = Integer.parseInt(commaTokens[i].trim()); }}",
+                    f"int startIndexFor{name} = (lineTokens.length > 1 && !parsedNumbers.isEmpty()) ? 1 : 0;",
+                    f"int arrayLengthFor{name} = Math.max(0, parsedNumbers.size() - startIndexFor{name});",
+                    f"int[] {name} = new int[arrayLengthFor{name}];",
+                    f"for (int i = 0; i < arrayLengthFor{name}; i++) {{ {name}[i] = parsedNumbers.get(i + startIndexFor{name}); }}",
                 ]
             )
             call_args.append(name)
@@ -1197,10 +1203,15 @@ def _java_wrapper_from_plan(plan: Dict[str, Any], runner_class: str = "Runner") 
             setup_lines.append(f"int {name} = {source}.length;")
             call_args.append(name)
         elif kind == "int":
-            source_index = int_index
-            setup_lines.append(
-                f'int {name} = Integer.parseInt((lineTokens.length > {source_index} ? lineTokens[{source_index}] : normalized).replaceAll("[A-Za-z_][A-Za-z0-9_]*\\\\s*=", " ").replace("[", "").replace("]", "").trim().split(",")[0].trim());'
-            )
+            if has_int_array and int_index == 0:
+                setup_lines.append(
+                    f'int {name} = parsedNumbers.isEmpty() ? 0 : parsedNumbers.get(0);'
+                )
+            else:
+                source_index = int_index
+                setup_lines.append(
+                    f'int {name} = Integer.parseInt((lineTokens.length > {source_index} ? lineTokens[{source_index}] : normalized).replaceAll("[A-Za-z_][A-Za-z0-9_]*\\\\s*=", " ").replace("[", "").replace("]", "").trim().split(",")[0].trim());'
+                )
             call_args.append(name)
             int_index += 1
         else:
@@ -1237,9 +1248,18 @@ def _c_wrapper_from_plan(plan: Dict[str, Any]) -> str:
         "if (!fgets(buffer, sizeof(buffer), stdin)) { return 0; }",
         'const char *delims = "[], \\n\\r\\t";',
         'for (char *p = buffer; *p; ++p) { if (*p == \'=\') { *p = \' \'; } }',
+        "int parsedNumbers[8192];",
+        "int parsedCount = 0;",
+        "char parseBuffer[65536];",
+        "strncpy(parseBuffer, buffer, sizeof(parseBuffer) - 1);",
+        "parseBuffer[sizeof(parseBuffer) - 1] = '\\0';",
+        "char *parseToken = strtok(parseBuffer, delims);",
+        "while (parseToken != NULL && parsedCount < 8192) { parsedNumbers[parsedCount++] = atoi(parseToken); parseToken = strtok(NULL, delims); }",
     ]
     call_args: List[str] = []
     array_name = ""
+    has_int_array = any(param.get("kind") == "int_array" for param in params)
+    int_index = 0
     for param in params:
         kind = param.get("kind")
         name = param.get("name") or f"arg{len(call_args)}"
@@ -1248,12 +1268,8 @@ def _c_wrapper_from_plan(plan: Dict[str, Any]) -> str:
             setup_lines.extend(
                 [
                     f"int {name}[8192];",
-                    f"int {name}_count = 0;",
-                    "char *token = strtok(buffer, delims);",
-                    f"while (token != NULL && {name}_count < 8192) {{",
-                    f"    {name}[{name}_count++] = atoi(token);",
-                    "    token = strtok(NULL, delims);",
-                    "}",
+                    f"int {name}_count = (parsedCount > 1) ? parsedCount - 1 : parsedCount;",
+                    f"for (int i = 0; i < {name}_count; ++i) {{ {name}[i] = parsedNumbers[(parsedCount > 1) ? i + 1 : i]; }}",
                 ]
             )
             call_args.append(name)
@@ -1262,8 +1278,12 @@ def _c_wrapper_from_plan(plan: Dict[str, Any]) -> str:
             setup_lines.append(f"int {name} = {source}_count;")
             call_args.append(name)
         elif kind == "int":
-            setup_lines.append(f"int {name} = atoi(buffer);")
+            if has_int_array and int_index == 0:
+                setup_lines.append(f"int {name} = parsedCount > 0 ? parsedNumbers[0] : 0;")
+            else:
+                setup_lines.append(f"int {name} = atoi(buffer);")
             call_args.append(name)
+            int_index += 1
         else:
             setup_lines.append(f"char *{name} = buffer;")
             call_args.append(name)
