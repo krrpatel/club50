@@ -120,14 +120,28 @@ class Submission(Base):
     code = Column(Text)
     status = Column(String, default=SubmissionStatus.QUEUED)
     verdict = Column(String, nullable=True)  # accepted, wrong_answer, tle, mle, rte, ce
-    check50_output = Column(JSON, nullable=True)  # Full check50 JSON output
+    check50_output = Column(JSON, nullable=True)  # Full check50 JSON output (deprecated)
+    
+    # New Piston-based evaluator fields
+    evaluation_report = Column(JSON, nullable=True)  # Full evaluation report from evaluator
     runtime_ms = Column(Integer, nullable=True)
     memory_mb = Column(Integer, nullable=True)
     error_message = Column(Text, nullable=True)
+    compile_error = Column(Text, nullable=True)
+    runtime_error = Column(Text, nullable=True)
+    
+    # Test case statistics
     public_test_passed = Column(Integer, default=0)
     public_test_total = Column(Integer, default=0)
     hidden_test_passed = Column(Integer, default=0)
     hidden_test_total = Column(Integer, default=0)
+    
+    # Code analysis
+    time_complexity = Column(String, nullable=True)  # e.g., O(n), O(n²)
+    space_complexity = Column(String, nullable=True)  # e.g., O(1), O(n)
+    code_issues = Column(JSON, nullable=True)  # List of detected issues
+    optimization_suggestions = Column(JSON, nullable=True)  # List of suggestions
+    
     created_at = Column(DateTime, server_default=func.now(), index=True)
     submitted_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)

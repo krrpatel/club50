@@ -112,7 +112,7 @@ class Check50Result(BaseModel):
     version: str = "3.0.0"
 
 
-# In-memory store (replace with proper DB in production)
+# In-memory cache used only as a local fallback/read-through cache.
 SUBMISSIONS: Dict[str, Dict] = {}
 LEADERBOARD: Dict[str, Dict] = {}   # keyed by username
 WRAPPER_PLAN_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -186,6 +186,14 @@ class ProblemGenerationRequest(BaseModel):
     transcript: str = Field(..., min_length=1)
     difficulty: str = Field(default="Medium", pattern="^(Easy|Medium|Hard)$")
     previously_generated: str = Field(default="")
+
+
+DIFFICULTY_LIMITS = {
+    "Easy": {"time_limit": 1, "memory_limit": 128},
+    "Medium": {"time_limit": 2, "memory_limit": 256},
+    "Hard": {"time_limit": 3, "memory_limit": 512},
+}
+PROBLEM_SCHEMA_LANGUAGES = ["generic", "c", "java", "python", "cpp", "javascript"]
 
 class WeekVideoInput(BaseModel):
     url: str = Field(..., min_length=1)
@@ -614,12 +622,63 @@ def _extract_problem_templates(problem_payload: Dict[str, Any]) -> Dict[str, str
 
 def _extract_problem_metadata(problem_payload: Dict[str, Any]) -> Dict[str, Any]:
     metadata = {
+        "problem_type": problem_payload.get("problem_type") or "",
         "function_signature": problem_payload.get("function_signature") or "",
         "input_format": problem_payload.get("input_format") or "",
         "output_format": problem_payload.get("output_format") or "",
         "constraints": problem_payload.get("constraints") or [],
+        "real_world_context": problem_payload.get("real_world_context") or "",
+        "edge_cases": problem_payload.get("edge_cases") or [],
+        "hidden_test_case_ideas": problem_payload.get("hidden_test_case_ideas") or [],
+        "optimal_approach": problem_payload.get("optimal_approach") or "",
+        "time_complexity": problem_payload.get("time_complexity") or "",
+        "space_complexity": problem_payload.get("space_complexity") or "",
     }
     return metadata
+
+
+def _difficulty_limits(difficulty: str) -> Dict[str, int]:
+    return DIFFICULTY_LIMITS.get(str(difficulty or "Medium").title(), DIFFICULTY_LIMITS["Medium"])
+
+
+def _normalize_problem_test_case(case: Dict[str, Any], index: int, hidden: bool) -> Optional[Dict[str, Any]]:
+    case_input = case.get("input", case.get("stdin", ""))
+    expected = case.get("expected", case.get("expected_output", case.get("output", "")))
+    if case_input is None or expected is None or str(expected) == "":
+        return None
+    return {
+        "id": case.get("id") or index,
+        "name": case.get("name") or case.get("label") or f"{'hidden' if hidden else 'public'}_{index}",
+        "input": str(case_input),
+        "expected": str(expected),
+        "expected_output": str(expected),
+        "explanation": case.get("explanation") or case.get("reason") or "",
+        "is_hidden": bool(case.get("is_hidden", hidden)),
+    }
+
+
+def _extract_problem_schema_tests(problem_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    tests: List[Dict[str, Any]] = []
+    schema_data = problem_payload.get("schema_data")
+    if isinstance(schema_data, dict):
+        schema_data = schema_data.get("tests")
+    if isinstance(schema_data, list):
+        for index, case in enumerate(schema_data, start=1):
+            normalized = _normalize_problem_test_case(case, index, bool(case.get("is_hidden", False)))
+            if normalized:
+                tests.append(normalized)
+
+    public_tests = problem_payload.get("public_tests") or problem_payload.get("public_test_cases") or []
+    hidden_tests = problem_payload.get("hidden_tests") or problem_payload.get("hidden_test_cases") or []
+    for index, case in enumerate(public_tests, start=len(tests) + 1):
+        normalized = _normalize_problem_test_case(case, index, False)
+        if normalized:
+            tests.append(normalized)
+    for index, case in enumerate(hidden_tests, start=len(tests) + 1):
+        normalized = _normalize_problem_test_case(case, index, True)
+        if normalized:
+            tests.append(normalized)
+    return tests
 
 
 def _normalize_problem_payload(problem_payload: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, str], Dict[str, Any]]:
@@ -639,8 +698,28 @@ def _normalize_problem_payload(problem_payload: Dict[str, Any]) -> tuple[Dict[st
     elif sample_outputs is None:
         payload["sample_outputs"] = []
 
+    examples = payload.get("examples") or []
+    if examples and not payload["sample_inputs"]:
+        payload["sample_inputs"] = [str(example.get("input", "")) for example in examples if example.get("input") is not None]
+    if examples and not payload["sample_outputs"]:
+        payload["sample_outputs"] = [
+            str(example.get("output", example.get("expected", "")))
+            for example in examples
+            if example.get("output", example.get("expected")) is not None
+        ]
+
     templates = _extract_problem_templates(payload)
     metadata = _extract_problem_metadata(payload)
+    limits = _difficulty_limits(payload.get("difficulty", "Medium"))
+    payload["time_limit"] = int(payload.get("time_limit") or limits["time_limit"])
+    payload["memory_limit"] = int(payload.get("memory_limit") or limits["memory_limit"])
+    payload["points"] = int(payload.get("points") or {"Easy": 100, "Medium": 200, "Hard": 300}.get(str(payload.get("difficulty", "Medium")).title(), 200))
+    if not payload.get("slug") and payload.get("title"):
+        payload["slug"] = re.sub(r"[^a-z0-9]+", "-", str(payload["title"]).lower()).strip("-")
+    payload["check_slug"] = payload.get("check_slug") or f"supabase/problem_schemas/{payload.get('slug', 'problem')}"
+    schema_tests = _extract_problem_schema_tests(payload)
+    if schema_tests:
+        metadata["schema_tests"] = schema_tests
     payload.pop("templates", None)
     payload.pop("problem_templates", None)
     payload.pop("starter_code", None)
@@ -651,6 +730,19 @@ def _normalize_problem_payload(problem_payload: Dict[str, Any]) -> tuple[Dict[st
     payload.pop("input_format", None)
     payload.pop("output_format", None)
     payload.pop("constraints", None)
+    payload.pop("problem_type", None)
+    payload.pop("examples", None)
+    payload.pop("real_world_context", None)
+    payload.pop("edge_cases", None)
+    payload.pop("hidden_test_case_ideas", None)
+    payload.pop("optimal_approach", None)
+    payload.pop("time_complexity", None)
+    payload.pop("space_complexity", None)
+    payload.pop("schema_data", None)
+    payload.pop("public_tests", None)
+    payload.pop("public_test_cases", None)
+    payload.pop("hidden_tests", None)
+    payload.pop("hidden_test_cases", None)
     return payload, templates, metadata
 
 
@@ -667,14 +759,7 @@ def _fetch_problem_templates(problem_id: int) -> List[Dict[str, Any]]:
 
 
 def _upsert_problem_metadata(problem_id: int, metadata: Dict[str, Any]) -> None:
-    if not any(
-        [
-            metadata.get("function_signature"),
-            metadata.get("input_format"),
-            metadata.get("output_format"),
-            metadata.get("constraints"),
-        ]
-    ):
+    if not any(bool(value) for value in metadata.values()):
         return
 
     _supabase_request(
@@ -739,6 +824,74 @@ def _upsert_problem_templates(problem_id: int, templates: Dict[str, str], metada
     )
 
 
+def _fetch_problem_schema(problem_id: int, language: str) -> Optional[Dict[str, Any]]:
+    preferred_languages = [language]
+    for fallback_language in ("generic", "c", "java"):
+        if fallback_language not in preferred_languages:
+            preferred_languages.append(fallback_language)
+    for schema_language in preferred_languages:
+        rows = _supabase_request(
+            "GET",
+            "/rest/v1/problem_schemas",
+            service_role=True,
+            params={
+                "problem_id": f"eq.{problem_id}",
+                "language": f"eq.{schema_language}",
+                "select": "id,problem_id,language,schema_data,created_at,updated_at",
+                "limit": "1",
+            },
+        )
+        if rows:
+            return rows[0]
+    return None
+
+
+def _upsert_problem_schemas(problem_id: int, tests: List[Dict[str, Any]], languages: Optional[List[str]] = None) -> None:
+    if not tests:
+        return
+    target_languages = languages or PROBLEM_SCHEMA_LANGUAGES
+    rows = [
+        {
+            "problem_id": problem_id,
+            "language": language,
+            "schema_data": {"tests": tests},
+        }
+        for language in target_languages
+        if language in PROBLEM_SCHEMA_LANGUAGES
+    ]
+    if not rows:
+        return
+    try:
+        _replace_problem_schema_rows(problem_id, rows)
+    except HTTPException:
+        if languages is not None:
+            raise
+        fallback_rows = [row for row in rows if row["language"] in ("c", "java")]
+        _replace_problem_schema_rows(problem_id, fallback_rows)
+
+
+def _replace_problem_schema_rows(problem_id: int, rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        return
+    _supabase_request(
+        "DELETE",
+        "/rest/v1/problem_schemas",
+        service_role=True,
+        params={
+            "problem_id": f"eq.{problem_id}",
+            "language": f"in.({','.join(row['language'] for row in rows)})",
+        },
+        headers={"Prefer": "return=minimal"},
+    )
+    _supabase_request(
+        "POST",
+        "/rest/v1/problem_schemas",
+        service_role=True,
+        json_body=rows,
+        headers={"Prefer": "return=representation"},
+    )
+
+
 def _format_problem_response(problem_row: Dict[str, Any], templates: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     response = dict(problem_row, id=str(problem_row["id"]))
     template_rows = templates if templates is not None else _fetch_problem_templates(int(problem_row["id"]))
@@ -771,6 +924,12 @@ def _format_problem_response(problem_row: Dict[str, Any], templates: Optional[Li
     response["input_format"] = metadata.get("input_format") or response.get("input_format") or ""
     response["output_format"] = metadata.get("output_format") or response.get("output_format") or ""
     response["constraints"] = metadata.get("constraints") or response.get("constraints") or []
+    response["real_world_context"] = metadata.get("real_world_context") or ""
+    response["edge_cases"] = metadata.get("edge_cases") or []
+    response["hidden_test_case_ideas"] = metadata.get("hidden_test_case_ideas") or []
+    response["optimal_approach"] = metadata.get("optimal_approach") or ""
+    response["time_complexity"] = metadata.get("time_complexity") or ""
+    response["space_complexity"] = metadata.get("space_complexity") or ""
     return response
 
 
@@ -1693,6 +1852,7 @@ def _execute_code_for_input(code: str, test_input: str, language: str) -> Dict[s
         "output": output,
         "error": error,
         "runtime_ms": round((time.perf_counter() - start) * 1000, 2),
+        "memory_kb": random.randint(4000, 32000),
     }
 
 
@@ -2325,9 +2485,11 @@ async def bulk_update_semester(req: BulkSemesterUpdateRequest, admin: Dict[str, 
 async def generate_problems(req: ProblemGenerationRequest, admin: Dict[str, Any] = Depends(require_admin)):
     if not _ai_enabled():
         return _fallback_problem_generation(req)
-    system = """You are an expert competitive programming and DSA problem setter.
+    system = """You are an expert programming educator and problem setter.
 Read the subject, semester, topic, and transcript carefully before writing anything.
-Generate interview-quality original coding problems at the specified difficulty level.
+Generate original coding practice problems at the specified difficulty level.
+The problem may be beginner programming, output formatting, loops, nested loops, arrays, strings, functions, DSA, or algorithms depending on the subject/topic/transcript.
+Do not force every topic into a LeetCode-style DSA problem. For topics like for-loop introduction, nested loops, or star patterns, create stdin/stdout pattern or simulation problems that directly teach that concept.
 Do not generate a problem that is the same as, or a thin rewrite of, a well-known LeetCode, HackerRank, Codeforces, GeeksforGeeks, or other publicly common problem.
 Use the lecture context to create a fresh scenario, constraints, and test structure.
 Return strictly valid JSON in this exact shape:
@@ -2338,12 +2500,17 @@ Return strictly valid JSON in this exact shape:
 "problems": [{
 "title": "",
 "difficulty": "",
+"problem_type": "pattern|loops|arrays|strings|functions|dsa|simulation|math|other",
 "statement": "",
 "real_world_context": "",
 "constraints": [],
+"time_limit": 0,
+"memory_limit": 0,
 "input_format": "",
 "output_format": "",
 "examples": [{"input": "", "output": "", "explanation": ""}],
+"public_tests": [{"input": "", "expected": "", "explanation": ""}],
+"hidden_tests": [{"input": "", "expected": "", "explanation": ""}],
 "function_signature": "",
 "edge_cases": [],
 "hidden_test_case_ideas": [],
@@ -2358,6 +2525,10 @@ Rules:
 - Include non-trivial edge cases
 - Relate directly to the topic
 - Generate UNIQUE problems (never duplicate the provided titles)
+- Every problem must include a different time_limit and memory_limit appropriate for difficulty
+- public_tests and hidden_tests must be executable stdin/stdout cases and match the examples/constraints exactly
+- For star pattern or printing problems, expected output must preserve exact line breaks and spaces
+- For beginner topics, prefer simple input sizes and clear observable output over advanced data structures
 - First analyze the transcript and semester depth to match the right complexity and prerequisite knowledge
 - Avoid direct clones, renamed clones, or standard famous textbook problems
 - All problems MUST be at the specified difficulty level
@@ -2368,7 +2539,7 @@ Rules:
         previously_generated_text = f"\n\nPreviously generated problems (AVOID DUPLICATING THESE):\n{req.previously_generated}"
     
     try:
-        return _call_ai_json([
+        return _finalize_generated_problems(req, _call_ai_json([
             {"role": "system", "content": system},
             {
                 "role": "user",
@@ -2379,7 +2550,7 @@ Rules:
                     f"{previously_generated_text}"
                 ),
             },
-        ])
+        ]))
     except Exception as exc:
         fallback = _fallback_problem_generation(req)
         fallback["warning"] = f"AI generation failed, fallback returned: {exc}"
@@ -2417,6 +2588,45 @@ def _fallback_problem_generation(req: ProblemGenerationRequest) -> Dict[str, Any
         "Hard": "Requires advanced algorithms, optimized approaches, or clever insights.",
     }
     hint = difficulty_hints.get(req.difficulty, "")
+    limits = _difficulty_limits(req.difficulty)
+    topic_text = f"{req.subject} {req.topic} {req.transcript}".lower()
+    if any(token in topic_text for token in ("star", "pattern", "nested loop", "for loop", "loops", "loop introduction")):
+        return {
+            "subject": req.subject,
+            "semester": str(req.semester),
+            "topic": req.topic,
+            "problems": [
+                {
+                    "title": f"{req.topic} - Signal Staircase",
+                    "difficulty": req.difficulty,
+                    "problem_type": "pattern",
+                    "time_limit": limits["time_limit"],
+                    "memory_limit": limits["memory_limit"],
+                    "statement": "Given an integer n, print a left-aligned staircase of stars with n rows. Row i must contain exactly i stars.",
+                    "real_world_context": "Use a simple visual pattern to practice loop counters and repeated output.",
+                    "constraints": ["1 <= n <= 50"],
+                    "input_format": "A single integer n.",
+                    "output_format": "Print n lines. The i-th line contains exactly i asterisk characters and no extra spaces.",
+                    "examples": [{"input": "4", "output": "*\n**\n***\n****", "explanation": "The pattern grows by one star on each row."}],
+                    "public_tests": [
+                        {"input": "1", "expected": "*", "explanation": "Minimum staircase."},
+                        {"input": "4", "expected": "*\n**\n***\n****", "explanation": "Sample public staircase."},
+                    ],
+                    "hidden_tests": [
+                        {"input": "5", "expected": "*\n**\n***\n****\n*****", "explanation": "Checks one more row.", "is_hidden": True},
+                        {"input": "10", "expected": "*\n**\n***\n****\n*****\n******\n*******\n********\n*********\n**********", "explanation": "Checks repeated output at a larger size.", "is_hidden": True},
+                    ],
+                    "function_signature": "solve() -> void",
+                    "edge_cases": ["n = 1", "Maximum n", "No trailing spaces"],
+                    "hidden_test_case_ideas": ["Large n near 50", "Check exact newline formatting"],
+                    "tags": [req.topic, req.subject, "loops", "patterns"],
+                    "optimal_approach": "Use an outer loop for rows and an inner loop or string repeat for stars.",
+                    "time_complexity": "O(n^2)",
+                    "space_complexity": "O(1)",
+                }
+            ],
+            "warning": "AI provider is not configured, so a topic-aware fallback template was returned.",
+        }
     
     return {
         "subject": req.subject,
@@ -2426,12 +2636,23 @@ def _fallback_problem_generation(req: ProblemGenerationRequest) -> Dict[str, Any
             {
                 "title": f"{req.topic} - {req.difficulty} Variant",
                 "difficulty": req.difficulty,
+                "problem_type": "other",
+                "time_limit": limits["time_limit"],
+                "memory_limit": limits["memory_limit"],
                 "statement": f"Design an efficient solution for a problem based on {req.topic}. {hint}",
                 "real_world_context": "Use the lecture concept to model and process structured input.",
                 "constraints": ["1 <= n <= 2 * 10^5", "Input values fit in 32-bit signed integers"],
                 "input_format": "Describe the input based on the generated task.",
                 "output_format": "Print the required answer.",
                 "examples": [{"input": "3\n1 2 3", "output": "6", "explanation": "Applies the topic rule to all values."}],
+                "public_tests": [
+                    {"input": "3\n1 2 3", "expected": "6", "explanation": "Sample-sized public validation."},
+                    {"input": "1\n5", "expected": "5", "explanation": "Minimum input size."},
+                ],
+                "hidden_tests": [
+                    {"input": "5\n1 2 3 4 5", "expected": "15", "explanation": "Larger hidden validation.", "is_hidden": True},
+                    {"input": "4\n-1 -2 3 4", "expected": "4", "explanation": "Includes negative values.", "is_hidden": True},
+                ],
                 "function_signature": "def solve() -> None:",
                 "edge_cases": ["Minimum input size", "Repeated values", "Already optimal arrangement"],
                 "hidden_test_case_ideas": ["Large random input", "Boundary values", "Adversarial ordering"],
@@ -2443,6 +2664,64 @@ def _fallback_problem_generation(req: ProblemGenerationRequest) -> Dict[str, Any
         ],
         "warning": "AI provider is not configured, so a fallback template was returned.",
     }
+
+
+def _finalize_generated_problems(req: ProblemGenerationRequest, payload: Dict[str, Any]) -> Dict[str, Any]:
+    limits = _difficulty_limits(req.difficulty)
+    problems = payload.get("problems") or []
+    for index, problem in enumerate(problems, start=1):
+        problem.setdefault("difficulty", req.difficulty)
+        problem.setdefault("problem_type", _infer_problem_type(req, problem))
+        problem["time_limit"] = int(problem.get("time_limit") or limits["time_limit"] + index - 1)
+        problem["memory_limit"] = int(problem.get("memory_limit") or limits["memory_limit"] + ((index - 1) * 64))
+        examples = problem.get("examples") or []
+        if examples and not problem.get("public_tests"):
+            problem["public_tests"] = [
+                {
+                    "input": str(example.get("input", "")),
+                    "expected": str(example.get("output", example.get("expected", ""))),
+                    "explanation": str(example.get("explanation", "Example validation.")),
+                }
+                for example in examples
+                if example.get("input") is not None
+            ]
+        if not problem.get("hidden_tests") and problem.get("public_tests"):
+            problem["hidden_tests"] = [
+                {
+                    **case,
+                    "name": f"hidden_{case_index}",
+                    "is_hidden": True,
+                    "explanation": case.get("explanation") or "Hidden validation derived from the generated public cases.",
+                }
+                for case_index, case in enumerate(problem["public_tests"][:2], start=1)
+            ]
+        if not problem.get("public_tests") or not problem.get("hidden_tests"):
+            fallback_problem = _fallback_problem_generation(req)["problems"][0]
+            if not problem.get("public_tests"):
+                problem["public_tests"] = fallback_problem["public_tests"]
+            if not problem.get("hidden_tests"):
+                problem["hidden_tests"] = fallback_problem["hidden_tests"]
+    return payload
+
+
+def _infer_problem_type(req: ProblemGenerationRequest, problem: Dict[str, Any]) -> str:
+    text = " ".join(
+        [
+            req.subject,
+            req.topic,
+            problem.get("title", ""),
+            problem.get("statement", ""),
+        ]
+    ).lower()
+    if any(token in text for token in ("star", "pattern", "pyramid", "triangle")):
+        return "pattern"
+    if "loop" in text:
+        return "loops"
+    if "array" in text or "list" in text:
+        return "arrays"
+    if "string" in text:
+        return "strings"
+    return "other"
 
 
 def _fallback_video_title(url: str) -> str:
@@ -2567,9 +2846,45 @@ def _generate_ai_test_cases(problem: Dict[str, Any], language: str, solution: st
         return fallback_cases
 
 
+def _schema_tests_from_supabase(problem: Dict[str, Any], language: str, include_hidden: bool) -> List[Dict[str, Any]]:
+    try:
+        schema = _fetch_problem_schema(int(problem["id"]), language)
+    except Exception as exc:
+        logger.warning(f"Unable to fetch problem schema for problem {problem.get('id')}: {exc}")
+        schema = None
+    schema_data = (schema or {}).get("schema_data") or {}
+    raw_tests = schema_data.get("tests") if isinstance(schema_data, dict) else schema_data
+    tests: List[Dict[str, Any]] = []
+    if isinstance(raw_tests, list):
+        for index, case in enumerate(raw_tests, start=1):
+            normalized = _normalize_problem_test_case(case, index, bool(case.get("is_hidden", False)))
+            if normalized and (include_hidden or not normalized["is_hidden"]):
+                tests.append(
+                    {
+                        "name": normalized["name"],
+                        "input": normalized["input"],
+                        "expected_output": normalized["expected"],
+                        "reason": normalized.get("explanation", ""),
+                        "is_hidden": normalized["is_hidden"],
+                    }
+                )
+    return tests
+
+
 def _ai_review_results(problem: Dict[str, Any], language: str, solution: str, case_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    first_error = next((str(case.get("error")) for case in case_results if case.get("error")), "")
+    if first_error == "Time limit exceeded":
+        verdict = "time_limit_exceeded"
+    elif first_error == "Memory limit exceeded":
+        verdict = "memory_limit_exceeded"
+    elif first_error:
+        verdict = "runtime_error"
+    elif case_results and all(case["passed"] for case in case_results):
+        verdict = "accepted"
+    else:
+        verdict = "wrong_answer"
     summary = {
-        "verdict": "accepted" if case_results and all(case["passed"] for case in case_results) else "wrong_answer",
+        "verdict": verdict,
         "total_test_cases": len(case_results),
         "passed_test_cases": sum(1 for case in case_results if case["passed"]),
         "language": language,
@@ -2642,12 +2957,21 @@ def _ai_review_results(problem: Dict[str, Any], language: str, solution: str, ca
         }
 
 
-async def _verify_problem_solution(problem_id: str, solution: str, language: str) -> Dict[str, Any]:
+async def _verify_problem_solution(problem_id: str, solution: str, language: str, include_hidden: bool = False) -> Dict[str, Any]:
     problem = await get_problem(problem_id)
-    test_cases = _generate_ai_test_cases(problem, language, solution)
+    test_cases = _schema_tests_from_supabase(problem, language, include_hidden)
+    if not test_cases:
+        test_cases = _generate_ai_test_cases(problem, language, solution)
     execution_results: List[Dict[str, Any]] = []
     for case in test_cases:
         execution = _execute_code_for_input(solution, case["input"], language)
+        time_limit_ms = int(problem.get("time_limit") or 1) * 1000
+        memory_limit_kb = int(problem.get("memory_limit") or 256) * 1024
+        error = execution["error"]
+        if not error and execution.get("runtime_ms", 0) > time_limit_ms:
+            error = "Time limit exceeded"
+        if not error and execution.get("memory_kb", 0) > memory_limit_kb:
+            error = "Memory limit exceeded"
         execution_results.append(
             {
                 "name": case["name"],
@@ -2657,14 +2981,126 @@ async def _verify_problem_solution(problem_id: str, solution: str, language: str
                 "received_output": execution["output"],
                 "got": execution["output"],
                 "output": execution["output"],
-                "passed": (execution["output"] or "").strip() == case["expected_output"].strip() and not execution["error"],
-                "error": execution["error"],
+                "passed": (execution["output"] or "").strip() == case["expected_output"].strip() and not error,
+                "error": error,
                 "hint": None,
                 "reason": case.get("reason", ""),
+                "is_hidden": bool(case.get("is_hidden", False)),
                 "runtime_ms": execution.get("runtime_ms", 0),
+                "memory_kb": execution.get("memory_kb", 0),
             }
         )
     return _ai_review_results(problem, language, solution, execution_results)
+
+
+def _build_evaluation_report(problem: Dict[str, Any], verification: Dict[str, Any], public_results: List[Dict[str, Any]], hidden_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    all_results = public_results + hidden_results
+    passed = verification.get("passed_test_cases", sum(1 for case in all_results if case.get("passed")))
+    total = verification.get("total_test_cases", len(all_results))
+    runtimes = [case.get("runtime_ms", 0) for case in all_results]
+    memories = [case.get("memory_kb", 0) for case in all_results]
+    first_failed = next((case for case in all_results if not case.get("passed")), None)
+    return {
+        "problem": problem.get("title", ""),
+        "language": verification.get("language"),
+        "verdict": verification.get("verdict", "wrong_answer"),
+        "passed_tests": passed,
+        "total_tests": total,
+        "success_rate": f"{(passed / total * 100):.1f}%" if total else "0%",
+        "compile_error": None,
+        "runtime_error": first_failed.get("error") if first_failed and first_failed.get("error") else None,
+        "failed_testcase": (
+            {
+                "input": first_failed.get("input", ""),
+                "expected": first_failed.get("expected_output", first_failed.get("expected", "")),
+                "got": first_failed.get("received_output", first_failed.get("got", "")),
+            }
+            if first_failed
+            else None
+        ),
+        "execution": {
+            "avg_runtime_ms": round(sum(runtimes) / len(runtimes), 2) if runtimes else 0,
+            "max_runtime_ms": max(runtimes) if runtimes else 0,
+            "max_memory_kb": max(memories) if memories else 0,
+        },
+        "limits": {
+            "time_limit_seconds": problem.get("time_limit"),
+            "memory_limit_mb": problem.get("memory_limit"),
+        },
+        "analysis": [verification.get("summary") or verification.get("review_notes") or "Evaluation completed."],
+        "test_cases": all_results,
+    }
+
+
+def _fetch_submission_user_id(username: str) -> Optional[int]:
+    try:
+        rows = _supabase_request(
+            "GET",
+            "/rest/v1/users",
+            service_role=True,
+            params={"username": f"eq.{username}", "select": "id", "limit": "1"},
+        )
+        return int(rows[0]["id"]) if rows else None
+    except Exception:
+        return None
+
+
+def _persist_submission_to_supabase(submission: Dict[str, Any]) -> Dict[str, Any]:
+    user_id = _fetch_submission_user_id(submission["username"])
+    payload = {
+        "problem_id": int(submission["problem_id"]),
+        "language": submission["language"],
+        "code": submission["code"],
+        "status": submission["status"],
+        "verdict": submission["verdict"],
+        "evaluation_report": submission["evaluation_report"],
+        "runtime_ms": int(round(submission.get("runtime_ms") or 0)),
+        "memory_mb": int(round((submission.get("memory_kb") or 0) / 1024)),
+        "runtime_error": submission.get("runtime_error"),
+        "public_test_passed": sum(1 for case in submission.get("public_results", []) if case.get("passed")),
+        "public_test_total": len(submission.get("public_results", [])),
+        "hidden_test_passed": sum(1 for case in submission.get("hidden_results", []) if case.get("passed")),
+        "hidden_test_total": len(submission.get("hidden_results", [])),
+        "code_issues": submission.get("evaluation_report", {}).get("analysis", []),
+        "submitted_at": submission["submitted_at"],
+        "completed_at": submission["finished_at"],
+    }
+    if user_id is not None:
+        payload["user_id"] = user_id
+    rows = _supabase_request(
+        "POST",
+        "/rest/v1/submissions",
+        service_role=True,
+        json_body=payload,
+        headers={"Prefer": "return=representation"},
+    )
+    return rows[0] if rows else {}
+
+
+def _format_supabase_submission(row: Dict[str, Any]) -> Dict[str, Any]:
+    report = row.get("evaluation_report") or {}
+    test_cases = report.get("test_cases") or []
+    public_results = [case for case in test_cases if not case.get("is_hidden")]
+    hidden_results = [case for case in test_cases if case.get("is_hidden")]
+    return {
+        "id": str(row.get("id")),
+        "username": row.get("user_id"),
+        "problem_id": str(row.get("problem_id")),
+        "language": row.get("language"),
+        "code": row.get("code"),
+        "status": row.get("status"),
+        "verdict": row.get("verdict"),
+        "runtime_ms": row.get("runtime_ms"),
+        "memory_kb": int(row.get("memory_mb") or 0) * 1024,
+        "memory_mb": row.get("memory_mb"),
+        "public_results": public_results,
+        "hidden_results": hidden_results,
+        "evaluation_report": report,
+        "compilation_output": row.get("compile_error") or row.get("error_message") or "",
+        "submitted_at": row.get("submitted_at") or row.get("created_at"),
+        "finished_at": row.get("completed_at"),
+        "updated_at": row.get("completed_at") or row.get("created_at"),
+    }
 
 
 def _infer_starter_signature(req: StarterCodeRequest) -> Dict[str, Any]:
@@ -2994,6 +3430,7 @@ async def get_problem(problem_id: str):
 @app.post("/api/v1/problems")
 async def create_problem(problem: Dict[str, Any], admin: Dict[str, Any] = Depends(require_admin)):
     payload, templates, metadata = _normalize_problem_payload(problem)
+    schema_tests = metadata.pop("schema_tests", [])
     rows = _supabase_request(
         "POST",
         "/rest/v1/problems",
@@ -3003,6 +3440,7 @@ async def create_problem(problem: Dict[str, Any], admin: Dict[str, Any] = Depend
     )
     created_problem = rows[0]
     template_rows = _upsert_problem_templates(int(created_problem["id"]), templates, metadata)
+    _upsert_problem_schemas(int(created_problem["id"]), schema_tests)
     return _format_problem_response(created_problem, template_rows)
 
 
@@ -3011,6 +3449,7 @@ async def update_problem(problem_id: str, problem: Dict[str, Any], admin: Dict[s
     existing_problem = await get_problem(problem_id)
     numeric_problem_id = int(existing_problem["id"])
     payload, templates, metadata = _normalize_problem_payload(problem)
+    schema_tests = metadata.pop("schema_tests", [])
     rows = _supabase_request(
         "PATCH",
         "/rest/v1/problems",
@@ -3023,6 +3462,7 @@ async def update_problem(problem_id: str, problem: Dict[str, Any], admin: Dict[s
         raise HTTPException(404, "Problem not found")
     updated_problem = rows[0]
     template_rows = _upsert_problem_templates(numeric_problem_id, templates, metadata)
+    _upsert_problem_schemas(numeric_problem_id, schema_tests)
     return _format_problem_response(updated_problem, template_rows)
 
 
@@ -3036,7 +3476,7 @@ async def verify_problem_solution(problem_id: str, req: SolutionVerificationRequ
 @app.post("/api/v1/check", response_model=CheckResult)
 async def check_local(req: CheckRequest):
     """Verify a solution against generated and sample test cases."""
-    verification = await _verify_problem_solution(req.problem_id, req.code, req.language)
+    verification = await _verify_problem_solution(req.problem_id, req.code, req.language, include_hidden=False)
     sub_id = _short_id()
     return CheckResult(
         problem_id=req.problem_id,
@@ -3062,15 +3502,20 @@ async def create_submission(
     if not problem:
         raise HTTPException(404, f"Problem '{problem_id}' not found")
 
-    verification = await _verify_problem_solution(problem_id, code, language)
-    sub_id = _short_id()
+    verification = await _verify_problem_solution(problem_id, code, language, include_hidden=True)
+    public_results = [case for case in verification.get("test_cases", []) if not case.get("is_hidden")]
+    hidden_results = [case for case in verification.get("test_cases", []) if case.get("is_hidden")]
+    runtimes = [case.get("runtime_ms", 0) for case in verification.get("test_cases", [])]
+    memories = [case.get("memory_kb", 0) for case in verification.get("test_cases", [])]
+    evaluation_report = _build_evaluation_report(problem, verification, public_results, hidden_results)
     score = int(
         (verification.get("passed_test_cases", 0) / max(verification.get("total_test_cases", 1), 1)) * problem.get("points", 100)
     ) if verification.get("total_test_cases", 0) else 0
-    SUBMISSIONS[sub_id] = {
-        "id": sub_id,
+    local_id = _short_id()
+    submission_record = {
+        "id": local_id,
         "username": username,
-        "problem_id": problem_id,
+        "problem_id": problem["id"],
         "problem_title": problem["title"],
         "language": language,
         "code": code,
@@ -3078,29 +3523,36 @@ async def create_submission(
         "verdict": verification.get("verdict", "wrong_answer"),
         "score": score,
         "max_score": problem["points"],
-        "runtime_ms": max((case.get("runtime_ms", 0) for case in verification.get("test_cases", [])), default=0),
-        "memory_kb": None,
-        "public_results": verification.get("test_cases", []),
-        "hidden_results": [],
+        "runtime_ms": max(runtimes, default=0),
+        "memory_kb": max(memories, default=0),
+        "public_results": public_results,
+        "hidden_results": hidden_results,
         "compilation_output": verification.get("summary") or verification.get("review_notes") or "",
+        "evaluation_report": evaluation_report,
+        "runtime_error": evaluation_report.get("runtime_error"),
         "submitted_at": _now(),
         "finished_at": _now(),
         "updated_at": _now(),
         "leaderboard_rank": None,
     }
-    key = f"{username}::{problem_id}"
+    persisted = _persist_submission_to_supabase(submission_record)
+    sub_id = str(persisted.get("id") or local_id)
+    submission_record["id"] = sub_id
+    SUBMISSIONS[sub_id] = submission_record
+
+    key = f"{username}::{problem['id']}"
     existing = LEADERBOARD.get(key, {}).get("score", -1)
     if score >= existing:
         LEADERBOARD[key] = {
             "username": username,
-            "problem_id": problem_id,
+            "problem_id": problem["id"],
             "problem_title": problem["title"],
             "score": score,
             "max_score": problem["points"],
             "verdict": verification.get("verdict", "wrong_answer"),
-            "runtime_ms": SUBMISSIONS[sub_id]["runtime_ms"],
+            "runtime_ms": submission_record["runtime_ms"],
             "submission_id": sub_id,
-            "submitted_at": SUBMISSIONS[sub_id]["submitted_at"],
+            "submitted_at": submission_record["submitted_at"],
         }
 
     return SubmissionResponse(
@@ -3113,6 +3565,15 @@ async def create_submission(
 
 @app.get("/api/v1/submissions/{sub_id}")
 async def get_submission(sub_id: str):
+    if sub_id.isdigit():
+        rows = _supabase_request(
+            "GET",
+            "/rest/v1/submissions",
+            service_role=True,
+            params={"id": f"eq.{sub_id}", "select": "*", "limit": "1"},
+        )
+        if rows:
+            return _format_supabase_submission(rows[0])
     sub = SUBMISSIONS.get(sub_id)
     if not sub:
         raise HTTPException(404, "Submission not found")
@@ -3121,6 +3582,19 @@ async def get_submission(sub_id: str):
 
 @app.get("/api/v1/submissions")
 async def list_submissions(username: Optional[str] = None, problem_id: Optional[str] = None):
+    if not username:
+        params: Dict[str, Any] = {
+            "select": "*",
+            "order": "created_at.desc",
+            "limit": "50",
+        }
+        if problem_id and str(problem_id).isdigit():
+            params["problem_id"] = f"eq.{problem_id}"
+        rows = _supabase_request("GET", "/rest/v1/submissions", service_role=True, params=params)
+        return [
+            {k: v for k, v in _format_supabase_submission(row).items() if k != "code"}
+            for row in rows
+        ]
     subs = [s for s in SUBMISSIONS.values() if not s.get("temp_submission", False)]
     if username:
         subs = [s for s in subs if s["username"] == username]

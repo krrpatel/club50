@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 
 # Check if using async or sync
 is_async = settings.DATABASE_URL.startswith("postgresql+asyncpg://")
+AsyncSessionLocal = None
 
 if is_async:
     engine = create_async_engine(

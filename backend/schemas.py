@@ -234,6 +234,7 @@ class TestCaseSchema(BaseModel):
     input: str = Field(..., min_length=1)
     expected: str = Field(..., min_length=1)
     explanation: Optional[str] = None
+    is_hidden: bool = False
 
 
 class ProblemSchemaCreateSchema(BaseModel):
@@ -260,3 +261,55 @@ class ProblemSchemasResponseSchema(BaseModel):
     """All schemas for a problem"""
     problem_id: int
     schemas: Dict[str, ProblemSchemaResponseSchema]
+
+
+# ============================================================================
+# Evaluation Report Schemas (New Advanced Evaluator)
+# ============================================================================
+
+class FailedTestCaseSchema(BaseModel):
+    """Failed test case details"""
+    input: str
+    expected: str
+    got: str
+
+
+class ExecutionStatsSchema(BaseModel):
+    """Execution statistics"""
+    avg_runtime_ms: float
+    max_runtime_ms: Optional[float] = None
+    max_memory_kb: int
+
+
+class ComplexityAnalysisSchema(BaseModel):
+    """Code complexity analysis"""
+    time: str
+    space: str
+
+
+class EvaluationReportSchema(BaseModel):
+    """Advanced evaluation report from Piston-based evaluator"""
+    problem: str
+    language: str
+    verdict: str  # Accepted, Wrong Answer, Runtime Error, Compilation Error, TLE, MLE, Security Violation
+    passed_tests: int
+    total_tests: int
+    success_rate: str
+    compile_error: Optional[str] = None
+    runtime_error: Optional[str] = None
+    failed_testcase: Optional[FailedTestCaseSchema] = None
+    execution: ExecutionStatsSchema
+    complexity: ComplexityAnalysisSchema
+    analysis: List[str]
+    optimization_suggestions: List[str]
+    test_results: List[Dict[str, Any]] = []
+
+
+class SubmissionEvaluationResponse(BaseModel):
+    """Submission evaluation response"""
+    submission_id: int
+    evaluation: EvaluationReportSchema
+    created_at: datetime
+    
+    class Config:
+        from_attributes = True
