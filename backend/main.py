@@ -3036,7 +3036,34 @@ def _build_evaluation_report(problem: Dict[str, Any], verification: Dict[str, An
     }
 
 
+def _fetch_submission_profile(username: str) -> Optional[Dict[str, Any]]:
+    value = (username or "").strip()
+    if not value:
+        return None
+    filters = [
+        {"enrollment_number": f"eq.{_normalize_enrollment_number(value)}"},
+        {"id": f"eq.{value}"},
+        {"email": f"eq.{value.lower()}"},
+    ]
+    for filter_params in filters:
+        try:
+            rows = _supabase_request(
+                "GET",
+                "/rest/v1/profiles",
+                service_role=True,
+                params={**filter_params, "select": "*", "limit": "1"},
+            )
+            if rows:
+                return rows[0]
+        except Exception:
+            continue
+    return None
+
+
 def _fetch_submission_user_id(username: str) -> Optional[int]:
+    username = (username or "").strip()
+    if not username:
+        return None
     try:
         rows = _supabase_request(
             "GET",
@@ -3049,9 +3076,63 @@ def _fetch_submission_user_id(username: str) -> Optional[int]:
         return None
 
 
-def _persist_submission_to_supabase(submission: Dict[str, Any]) -> Dict[str, Any]:
-    user_id = _fetch_submission_user_id(submission["username"])
+def _ensure_submission_user_id(username: str) -> int:
+    existing_id = _fetch_submission_user_id(username)
+    if existing_id is not None:
+        return existing_id
+
+    profile = _fetch_submission_profile(username) or {}
+    normalized_username = (
+        profile.get("enrollment_number")
+        or profile.get("email")
+        or username
+        or "anonymous"
+    )
+    normalized_username = str(normalized_username).strip()
+    email = (
+        profile.get("email")
+        or f"{re.sub(r'[^a-zA-Z0-9_.+-]+', '_', normalized_username).lower()}@club50.local"
+    )
     payload = {
+        "username": normalized_username,
+        "email": str(email).strip().lower(),
+        "full_name": profile.get("full_name") or normalized_username,
+        "hashed_password": "managed-by-supabase-auth",
+        "is_active": True,
+    }
+    try:
+        rows = _supabase_request(
+            "POST",
+            "/rest/v1/users",
+            service_role=True,
+            json_body=payload,
+            params={"on_conflict": "username"},
+            headers={"Prefer": "resolution=merge-duplicates,return=representation"},
+        )
+        if rows:
+            return int(rows[0]["id"])
+    except HTTPException as exc:
+        logger.warning(f"Unable to create submission user for {username}: {exc.detail}")
+        if payload.get("email"):
+            try:
+                rows = _supabase_request(
+                    "GET",
+                    "/rest/v1/users",
+                    service_role=True,
+                    params={"email": f"eq.{payload['email']}", "select": "id", "limit": "1"},
+                )
+                if rows:
+                    return int(rows[0]["id"])
+            except Exception:
+                pass
+
+    raise HTTPException(409, "Unable to resolve submission user. Please sign out and log in again.")
+
+
+def _persist_submission_to_supabase(submission: Dict[str, Any]) -> Dict[str, Any]:
+    user_id = _ensure_submission_user_id(submission["username"])
+    payload = {
+        "user_id": user_id,
         "problem_id": int(submission["problem_id"]),
         "language": submission["language"],
         "code": submission["code"],
@@ -3069,8 +3150,6 @@ def _persist_submission_to_supabase(submission: Dict[str, Any]) -> Dict[str, Any
         "submitted_at": submission["submitted_at"],
         "completed_at": submission["finished_at"],
     }
-    if user_id is not None:
-        payload["user_id"] = user_id
     rows = _supabase_request(
         "POST",
         "/rest/v1/submissions",
