@@ -1221,11 +1221,13 @@ def _fallback_wrapper_plan(language: str, code: str) -> Optional[Dict[str, Any]]
             else:
                 params.append({"name": param_name, "kind": "string"})
                 last_array_name = ""
+        normalized_return_type = return_type.replace("_Bool", "bool")
+        return_kind = "bool" if "bool" in normalized_return_type else "int" if "int" in return_type else "string"
         return {
             "target_name": function_name,
             "target_container": "free_function",
             "is_static": True,
-            "return_kind": "int" if "int" in return_type else "string",
+            "return_kind": return_kind,
             "params": params,
         }
 
@@ -1449,13 +1451,15 @@ def _c_wrapper_from_plan(plan: Dict[str, Any]) -> str:
 
     target_name = plan.get("target_name") or "solve"
     return_kind = (plan.get("return_kind") or "int").lower()
-    if return_kind == "string":
+    if return_kind == "bool":
+        result_lines = [f'bool result = {target_name}({", ".join(call_args)});', 'printf("%s\\n", result ? "true" : "false");']
+    elif return_kind == "string":
         result_lines = [f'char *result = {target_name}({", ".join(call_args)});', 'printf("%s\\n", result);']
     else:
         result_lines = [f'int result = {target_name}({", ".join(call_args)});', 'printf("%d\\n", result);']
 
     return (
-        "\n#include <string.h>\n\nint main(void) {\n"
+        "\n#include <stdbool.h>\n#include <string.h>\n\nint main(void) {\n"
         + "\n".join(f"    {line}" for line in setup_lines + result_lines)
         + "\n    return 0;\n}\n"
     )
